@@ -53,6 +53,7 @@ MATCH_THRESHOLD = 0.55
 
 SLOW_REFRESH_SECONDS = 300   # активные сделки + время прихода — раз в 5 минут
 FAST_REFRESH_SECONDS = 45    # звонки + закрытые сделки за выбранную дату — чаще
+PLAN_REFRESH_SECONDS = 180   # обновление плана за выбранный период — раз в 3 минуты
 LOW_LOAD_TOP_N = 5
 ACTIVE_DEALS_WORKERS = 10    # сколько сотрудников опрашивать параллельно (ускоряет медленный шаг)
 
@@ -168,18 +169,20 @@ def get_active_deal_count(user_id, category_id):
     return (total if total is not None else len(result or [])), None
 
 
-def fetch_monthly_plan_stats(category_id):
-    """Закрытые сделки за ТЕКУЩИЙ МЕСЯЦ (план 660 на человека), с разбивкой
+def fetch_monthly_plan_stats(category_id, date_from_str, date_to_str):
+    """Закрытые сделки за ВЫБРАННЫЙ ПЕРИОД (план 660 на человека), с разбивкой
     успех/провал и обнаружением дублей — когда у одного клиента (CONTACT_ID)
-    несколько закрытых сделок, это может означать задвоенный учёт."""
-    now = datetime.now()
-    month_start = now.replace(day=1, hour=0, minute=0, second=0).strftime("%Y-%m-%dT00:00:00")
+    несколько закрытых сделок, это может означать задвоенный учёт.
+    date_from_str / date_to_str — строки 'YYYY-MM-DD'."""
+    period_start = f"{date_from_str}T00:00:00"
+    period_end = f"{date_to_str}T00:00:00"
 
     items, error = get_all_pages(
         "crm.deal.list",
         {
             "filter[CLOSED]": "Y",
-            "filter[>=CLOSEDATE]": month_start,
+            "filter[>=CLOSEDATE]": period_start,
+            "filter[<CLOSEDATE]": period_end,
             "filter[CATEGORY_ID]": category_id,
             "select[]": ["ASSIGNED_BY_ID", "STAGE_SEMANTIC_ID", "CONTACT_ID"],
         },
@@ -214,15 +217,20 @@ def fetch_monthly_plan_stats(category_id):
     return result, None
 
 
-def fetch_calls_split(day_start, day_end):
+def fetch_calls_split(day_start_dt, day_end_dt):
     """Звонки за период: входящие/исходящие, по ответственному, плюс список
     отдельных звонков с деталями (для показа по клику) и пометкой неудачных.
 
-    ВАЖНО: правильные ключи фильтра для voximplant.statistic.get —
-    'CALL_START_DATE_from' / 'CALL_START_DATE_to' (с маленькой from/to).
-    Раньше здесь стояли FROM/TO заглавными — фильтр не срабатывал вообще,
-    и Bitrix24 отдавал всю историю целиком, из-за чего дашборд зависал.
+    ВАЖНО про формат даты: voximplant.statistic.get на некоторых порталах
+    (с региональными настройками ДД.ММ.ГГГГ) не понимает ISO-формат дат
+    (2026-09-02T00:00:00) и тогда просто игнорирует фильтр целиком, отдавая
+    всю историю звонков. Поэтому здесь используем формат ДД.ММ.ГГГГ ЧЧ:ММ:СС,
+    которого Bitrix24 в большинстве случаев ждёт для этого метода.
     """
+    date_fmt = "%d.%m.%Y %H:%M:%S"
+    day_start = day_start_dt.strftime(date_fmt)
+    day_end = day_end_dt.strftime(date_fmt)
+
     items, error = get_all_pages(
         "voximplant.statistic.get",
         {
@@ -231,7 +239,7 @@ def fetch_calls_split(day_start, day_end):
             "SORT": "CALL_START_DATE",
             "ORDER": "DESC",
         },
-        max_pages=200,
+        max_pages=60,  # день реально не может содержать >3000 звонков; если упёрлись — фильтр снова не сработал
     )
 
     if error:
@@ -240,8 +248,8 @@ def fetch_calls_split(day_start, day_end):
             "crm.activity.list",
             {
                 "filter[TYPE_ID]": 2,
-                "filter[>=CREATED]": day_start,
-                "filter[<CREATED]": day_end,
+                "filter[>=CREATED]": day_start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "filter[<CREATED]": day_end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
                 "select[]": ["RESPONSIBLE_ID"],
             },
         )
@@ -258,6 +266,7 @@ def fetch_calls_split(day_start, day_end):
     outgoing = {}
     calls_by_user = {}  # uid -> list of call dicts (для показа деталей по клику)
 
+    out_of_range = 0
     for item in items or []:
         uid = item.get("PORTAL_USER_ID")
         if not uid:
@@ -290,6 +299,12 @@ def fetch_calls_split(day_start, day_end):
             "phone": item.get("PHONE_NUMBER", ""),
             "deal_link": deal_link,
         })
+
+    if items and len(items) > 20:
+        # быстрая проверка: если много звонков вне запрошенного дня — фильтр не сработал
+        sample_date = str(items[0].get("CALL_START_DATE", ""))
+        if sample_date and day_start_dt.strftime("%Y-%m-%d") not in sample_date and day_start_dt.strftime("%d.%m.%Y") not in sample_date:
+            print(f"[!] ПОДОЗРЕНИЕ: фильтр по дате звонков не сработал — первая запись датирована '{sample_date}', а ожидался {day_start_dt.date()}")
 
     return incoming, outgoing, calls_by_user, None
 
@@ -353,20 +368,24 @@ STATE = {
     "category_name": "",
     "active_deals": {},         # {uid: count} — обновляется медленно
     "attendance": {},           # {uid: {"start":..,"break":..}} — только сегодня
-    "monthly_plan": {},         # {uid: {"won":n, "lost":n, "total":n, "duplicate_clients":n}}
+    "category_id": None,
     "last_slow_update": None,
     "last_fast_update": None,
     "fast_cache": {},           # {date_str: {"in":{}, "out":{}, "won":{}, "lost":{}, "no_split":bool}}
     "fast_in_progress": set(),  # даты, которые прямо сейчас считаются в фоне (чтобы не запускать повторно)
+    "plan_cache": {},           # {"from_to": {"data":..., "computed_at":...}}
+    "plan_in_progress": set(),
     "errors": [],
 }
 FAST_IN_PROGRESS_LOCK = threading.Lock()
+PLAN_IN_PROGRESS_LOCK = threading.Lock()
 
 
 def slow_refresh_loop():
     category_id, category_name = find_deal_category_id()
     with STATE_LOCK:
         STATE["category_name"] = category_name or CATEGORY_NAME
+        STATE["category_id"] = category_id
 
     while True:
         try:
@@ -389,17 +408,10 @@ def slow_refresh_loop():
             relevant_ids = [uid for uid, c in active_deals.items() if c and c > 0]
             attendance = fetch_attendance_today(relevant_ids) if relevant_ids else {}
 
-            monthly_plan = {}
-            if category_id:
-                monthly_plan, plan_error = fetch_monthly_plan_stats(category_id)
-                if plan_error:
-                    print(f"[!] Ошибка расчёта плана за месяц: {plan_error}")
-
             with STATE_LOCK:
                 STATE["users_by_id"] = users_by_id
                 STATE["active_deals"] = active_deals
                 STATE["attendance"] = attendance
-                STATE["monthly_plan"] = monthly_plan
                 STATE["last_slow_update"] = datetime.now().strftime("%H:%M:%S")
             elapsed = time.time() - t_start
             print(f"[slow refresh] {datetime.now().strftime('%H:%M:%S')} — сотрудников: {len(users_by_id)}, с активными сделками: {len(relevant_ids)}, заняло {elapsed:.1f} сек")
@@ -410,10 +422,12 @@ def slow_refresh_loop():
 
 
 def fast_refresh_for_date(date_str):
-    day_start = f"{date_str}T00:00:00"
-    day_end = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+    day_start_dt = datetime.strptime(date_str, "%Y-%m-%d")
+    day_end_dt = day_start_dt + timedelta(days=1)
+    day_start = day_start_dt.strftime("%Y-%m-%dT00:00:00")
+    day_end = day_end_dt.strftime("%Y-%m-%dT00:00:00")
 
-    incoming, outgoing, calls_by_user, call_err = fetch_calls_split(day_start, day_end)
+    incoming, outgoing, calls_by_user, call_err = fetch_calls_split(day_start_dt, day_end_dt)
     won, lost, closed_err = fetch_closed_split(day_start, day_end)
 
     bad_calls = {}
@@ -446,6 +460,68 @@ def fast_refresh_loop():
         except Exception as e:
             print(f"[fast refresh] ОШИБКА: {e}")
         time.sleep(FAST_REFRESH_SECONDS)
+
+
+def refresh_plan_for_range(date_from, date_to):
+    with STATE_LOCK:
+        category_id = STATE["category_id"]
+    if not category_id:
+        return
+    data, error = fetch_monthly_plan_stats(category_id, date_from, date_to)
+    key = f"{date_from}_{date_to}"
+    with STATE_LOCK:
+        STATE["plan_cache"][key] = {
+            "data": data if not error else {},
+            "error": error,
+            "computed_at": datetime.now().strftime("%H:%M:%S"),
+        }
+    if error:
+        print(f"[plan] ОШИБКА расчёта плана {date_from}..{date_to}: {error}")
+    else:
+        total = sum(v["total"] for v in data.values())
+        print(f"[plan] {date_from}..{date_to} — сотрудников с закрытыми: {len(data)}, всего закрыто: {total}")
+
+
+def get_plan_data(date_from, date_to):
+    """Отдаёт кэш плана за период, запускает фоновый пересчёт если нужно
+    (кэш старше 5 минут или отсутствует). Не блокирует страницу."""
+    key = f"{date_from}_{date_to}"
+    with STATE_LOCK:
+        entry = STATE["plan_cache"].get(key)
+
+    if entry is None:
+        with PLAN_IN_PROGRESS_LOCK:
+            already_running = key in STATE["plan_in_progress"]
+            if not already_running:
+                STATE["plan_in_progress"].add(key)
+        if not already_running:
+            def _bg(f=date_from, t=date_to, k=key):
+                try:
+                    refresh_plan_for_range(f, t)
+                except Exception as e:
+                    print(f"[plan on-demand] ОШИБКА: {e}")
+                finally:
+                    with PLAN_IN_PROGRESS_LOCK:
+                        STATE["plan_in_progress"].discard(k)
+            threading.Thread(target=_bg, daemon=True).start()
+        return {}, True, None  # пусто, ещё грузится
+
+    return entry.get("data", {}), False, entry.get("error")
+
+
+def plan_refresh_loop():
+    """Раз в PLAN_REFRESH_SECONDS обновляет план для последнего запрошенного
+    периода (чтобы данные не протухали, пока страница открыта)."""
+    while True:
+        time.sleep(PLAN_REFRESH_SECONDS)
+        with STATE_LOCK:
+            keys = list(STATE["plan_cache"].keys())
+        for key in keys:
+            try:
+                date_from, date_to = key.split("_", 1)
+                refresh_plan_for_range(date_from, date_to)
+            except Exception as e:
+                print(f"[plan refresh] ОШИБКА для {key}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -574,8 +650,16 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <div class="toolbar">
     <div class="date-box">
-      <label>Дата</label>
+      <label>Дата (звонки/сделки)</label>
       <input type="date" id="datePicker">
+    </div>
+    <div class="date-box">
+      <label>План с</label>
+      <input type="date" id="planFromPicker">
+    </div>
+    <div class="date-box">
+      <label>по</label>
+      <input type="date" id="planToPicker">
     </div>
     <div class="date-box">
       <label>🔍</label>
@@ -624,13 +708,36 @@ HTML_PAGE = """<!DOCTYPE html>
 
 <script>
 const datePicker = document.getElementById('datePicker');
+const planFromPicker = document.getElementById('planFromPicker');
+const planToPicker = document.getElementById('planToPicker');
 const today = new Date().toISOString().slice(0,10);
 datePicker.value = today;
 
+// План-период сохраняется в localStorage — "на постоянной основе",
+// не сбрасывается при обновлении страницы. По умолчанию — текущий месяц.
+function defaultPlanRange() {
+  const now = new Date();
+  const from = new Date(now.getFullYear(), now.getMonth(), 1);
+  const to = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  return {from: from.toISOString().slice(0,10), to: to.toISOString().slice(0,10)};
+}
+const savedFrom = localStorage.getItem('plan_from');
+const savedTo = localStorage.getItem('plan_to');
+const defaults = defaultPlanRange();
+planFromPicker.value = savedFrom || defaults.from;
+planToPicker.value = savedTo || defaults.to;
+
+function savePlanRange() {
+  localStorage.setItem('plan_from', planFromPicker.value);
+  localStorage.setItem('plan_to', planToPicker.value);
+}
+
 async function loadData() {
   const date = datePicker.value;
+  const planFrom = planFromPicker.value;
+  const planTo = planToPicker.value;
   try {
-    const resp = await fetch('/api/data?date=' + date);
+    const resp = await fetch(`/api/data?date=${date}&plan_from=${planFrom}&plan_to=${planTo}`);
     const data = await resp.json();
     render(data);
   } catch (e) {
@@ -663,6 +770,12 @@ function render(data) {
   }
   if (data.calls_loading) {
     banners.innerHTML += `<div class="loading-banner">⏳ Считаю звонки и закрытые сделки за эту дату в фоне — обновится само через 10-20 секунд, страницу перезагружать не нужно.</div>`;
+  }
+  if (data.plan_loading) {
+    banners.innerHTML += `<div class="loading-banner">⏳ Считаю план за выбранный период (${data.plan_period_label}) в фоне — обновится само, страницу перезагружать не нужно.</div>`;
+  }
+  if (data.plan_error) {
+    banners.innerHTML += `<div class="warning-banner">⚠️ Ошибка при расчёте плана: ${data.plan_error}</div>`;
   }
   if (data.call_error) {
     banners.innerHTML += `<div class="warning-banner">⚠️ Ошибка при получении звонков: ${data.call_error}</div>`;
@@ -853,6 +966,8 @@ function exportCSV() {
 document.getElementById('searchBox').addEventListener('input', () => renderTable(window.__lastData));
 document.getElementById('exportBtn').addEventListener('click', exportCSV);
 datePicker.addEventListener('change', loadData);
+planFromPicker.addEventListener('change', () => { savePlanRange(); loadData(); });
+planToPicker.addEventListener('change', () => { savePlanRange(); loadData(); });
 loadData();
 setInterval(loadData, 20000); // обновление раз в 20 секунд
 </script>
@@ -875,7 +990,14 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/data":
             qs = urllib.parse.parse_qs(parsed.query)
             date_str = qs.get("date", [datetime.now().strftime("%Y-%m-%d")])[0]
-            payload = self.build_payload(date_str)
+            now = datetime.now()
+            default_plan_from = now.replace(day=1).strftime("%Y-%m-%d")
+            next_month = now.month % 12 + 1
+            next_month_year = now.year + (1 if now.month == 12 else 0)
+            default_plan_to = f"{next_month_year}-{next_month:02d}-01"
+            plan_from = qs.get("plan_from", [default_plan_from])[0]
+            plan_to = qs.get("plan_to", [default_plan_to])[0]
+            payload = self.build_payload(date_str, plan_from, plan_to)
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -886,16 +1008,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def build_payload(self, date_str):
+    def build_payload(self, date_str, plan_from, plan_to):
         with STATE_LOCK:
             users_by_id = dict(STATE["users_by_id"])
             active_deals = dict(STATE["active_deals"])
             attendance = dict(STATE["attendance"])
-            monthly_plan = dict(STATE["monthly_plan"])
             category_name = STATE["category_name"]
             last_slow = STATE["last_slow_update"]
             last_fast = STATE["last_fast_update"]
             fast_entry = STATE["fast_cache"].get(date_str)
+
+        monthly_plan, plan_loading, plan_error = get_plan_data(plan_from, plan_to)
 
         # если по этой дате ещё нет данных в кэше — запускаем расчёт В ФОНЕ,
         # а сейчас сразу отвечаем тем, что есть (не блокируем страницу)
@@ -962,12 +1085,13 @@ class Handler(BaseHTTPRequestHandler):
 
         rows.sort(key=lambda r: r["active_deals"])
 
-        # план начинается 1-го числа месяца, до 1-го числа следующего
-        now = datetime.now()
-        month_names = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
-        next_month = now.month % 12 + 1
-        next_month_year = now.year + (1 if now.month == 12 else 0)
-        plan_period_label = f"1 {month_names[now.month-1]} – 1 {month_names[next_month-1]}"
+        # красивая подпись периода из фактически выбранных дат (dd.mm.yyyy)
+        def fmt_date(s):
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").strftime("%d.%m.%Y")
+            except ValueError:
+                return s
+        plan_period_label = f"{fmt_date(plan_from)} – {fmt_date(plan_to)}"
 
         leaderboard = sorted(
             [r for r in rows if r["plan_total"] > 0],
@@ -983,9 +1107,13 @@ class Handler(BaseHTTPRequestHandler):
             "low_load_top_n": LOW_LOAD_TOP_N,
             "still_loading": last_slow is None,
             "calls_loading": calls_loading,
+            "plan_loading": plan_loading,
+            "plan_error": plan_error,
             "call_error": fast_entry.get("call_error"),
             "closed_error": fast_entry.get("closed_error"),
             "plan_period_label": plan_period_label,
+            "plan_from": plan_from,
+            "plan_to": plan_to,
             "leaderboard": leaderboard,
             "monthly_plan_target": MONTHLY_PLAN,
             "monthly_plan_half": MONTHLY_PLAN // 2,
@@ -1014,6 +1142,7 @@ def main():
     print("Запускаю фоновое обновление данных...")
     threading.Thread(target=slow_refresh_loop, daemon=True).start()
     threading.Thread(target=fast_refresh_loop, daemon=True).start()
+    threading.Thread(target=plan_refresh_loop, daemon=True).start()
 
     print(f"Сервер слушает на порту {port}")
     print("Ctrl+C — остановить (при локальном запуске).")
