@@ -418,10 +418,13 @@ def refresh_range(date_from, date_to):
         return
 
     start_dt = datetime.strptime(date_from, "%Y-%m-%d")
-    end_dt = datetime.strptime(date_to, "%Y-%m-%d")
+    # "по" включительно — конец периода это НАЧАЛО СЛЕДУЮЩЕГО дня после date_to,
+    # иначе при date_from == date_to получается нулевой по ширине интервал (0 звонков всегда)
+    end_dt = datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)
+    date_to_exclusive = end_dt.strftime("%Y-%m-%d")
 
     calls_data, call_error = fetch_calls_in_range(start_dt, end_dt)
-    closed_data, closed_error = fetch_closed_in_range(category_id, date_from, date_to)
+    closed_data, closed_error = fetch_closed_in_range(category_id, date_from, date_to_exclusive)
 
     key = f"{date_from}_{date_to}"
     with STATE_LOCK:
