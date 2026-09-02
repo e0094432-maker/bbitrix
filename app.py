@@ -32,6 +32,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -46,6 +47,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 REQUEST_DELAY = 0.25
 MAX_RETRIES = 3
 CATEGORY_NAME = "Досудебный отдел"
+MONTHLY_PLAN = 660  # план закрытых сделок на месяц на каждого сотрудника
+PORTAL_DOMAIN = None  # определяется из webhook при запуске, для ссылок в CRM
 MATCH_THRESHOLD = 0.55
 
 SLOW_REFRESH_SECONDS = 300   # активные сделки + время прихода — раз в 5 минут
@@ -165,6 +168,52 @@ def get_active_deal_count(user_id, category_id):
     return (total if total is not None else len(result or [])), None
 
 
+def fetch_monthly_plan_stats(category_id):
+    """Закрытые сделки за ТЕКУЩИЙ МЕСЯЦ (план 660 на человека), с разбивкой
+    успех/провал и обнаружением дублей — когда у одного клиента (CONTACT_ID)
+    несколько закрытых сделок, это может означать задвоенный учёт."""
+    now = datetime.now()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0).strftime("%Y-%m-%dT00:00:00")
+
+    items, error = get_all_pages(
+        "crm.deal.list",
+        {
+            "filter[CLOSED]": "Y",
+            "filter[>=CLOSEDATE]": month_start,
+            "filter[CATEGORY_ID]": category_id,
+            "select[]": ["ASSIGNED_BY_ID", "STAGE_SEMANTIC_ID", "CONTACT_ID"],
+        },
+        max_pages=400,
+    )
+    if error:
+        return {}, error
+
+    per_user = {}  # uid -> {"won": n, "lost": n, "contacts": {contact_id: count}}
+    for item in items or []:
+        uid = item.get("ASSIGNED_BY_ID")
+        if not uid:
+            continue
+        bucket = per_user.setdefault(uid, {"won": 0, "lost": 0, "contacts": {}})
+        if item.get("STAGE_SEMANTIC_ID") == "S":
+            bucket["won"] += 1
+        else:
+            bucket["lost"] += 1
+        contact_id = item.get("CONTACT_ID")
+        if contact_id:
+            bucket["contacts"][contact_id] = bucket["contacts"].get(contact_id, 0) + 1
+
+    result = {}
+    for uid, b in per_user.items():
+        dup_count = sum(1 for c, n in b["contacts"].items() if n > 1)
+        result[uid] = {
+            "won": b["won"],
+            "lost": b["lost"],
+            "total": b["won"] + b["lost"],
+            "duplicate_clients": dup_count,
+        }
+    return result, None
+
+
 def fetch_calls_split(day_start, day_end):
     """Звонки за период, разбитые на входящие/исходящие, по ответственному.
     ВРЕМЕННО ОТКЛЮЧЕНО: voximplant.statistic.get не фильтруется по дате
@@ -249,6 +298,7 @@ STATE = {
     "category_name": "",
     "active_deals": {},         # {uid: count} — обновляется медленно
     "attendance": {},           # {uid: {"start":..,"break":..}} — только сегодня
+    "monthly_plan": {},         # {uid: {"won":n, "lost":n, "total":n, "duplicate_clients":n}}
     "last_slow_update": None,
     "last_fast_update": None,
     "fast_cache": {},           # {date_str: {"in":{}, "out":{}, "won":{}, "lost":{}, "no_split":bool}}
@@ -284,10 +334,17 @@ def slow_refresh_loop():
             relevant_ids = [uid for uid, c in active_deals.items() if c and c > 0]
             attendance = fetch_attendance_today(relevant_ids) if relevant_ids else {}
 
+            monthly_plan = {}
+            if category_id:
+                monthly_plan, plan_error = fetch_monthly_plan_stats(category_id)
+                if plan_error:
+                    print(f"[!] Ошибка расчёта плана за месяц: {plan_error}")
+
             with STATE_LOCK:
                 STATE["users_by_id"] = users_by_id
                 STATE["active_deals"] = active_deals
                 STATE["attendance"] = attendance
+                STATE["monthly_plan"] = monthly_plan
                 STATE["last_slow_update"] = datetime.now().strftime("%H:%M:%S")
             elapsed = time.time() - t_start
             print(f"[slow refresh] {datetime.now().strftime('%H:%M:%S')} — сотрудников: {len(users_by_id)}, с активными сделками: {len(relevant_ids)}, заняло {elapsed:.1f} сек")
@@ -401,6 +458,17 @@ HTML_PAGE = """<!DOCTYPE html>
   .won { color: var(--green); font-weight: 600; }
   .lost { color: var(--red); font-weight: 600; }
   .empty-cell { color: #cbd5e1; }
+  .export-btn { background: white; border: 1px solid var(--border); border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 600; color: var(--text); cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
+  .export-btn:hover { background: #f3f4f6; }
+  .name-link { color: var(--text); text-decoration: none; }
+  .name-link:hover { color: var(--accent); text-decoration: underline; }
+  .plan-cell { min-width: 150px; }
+  .plan-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: #f1f5f9; margin-bottom: 4px; }
+  .plan-bar .won-part { background: var(--green); }
+  .plan-bar .lost-part { background: var(--red); }
+  .plan-label { font-size: 11.5px; color: var(--muted); }
+  .plan-label .over-limit { color: var(--red); font-weight: 700; }
+  .dup-badge { font-size: 10.5px; color: var(--amber); margin-left: 4px; cursor: help; }
 </style>
 </head>
 <body>
@@ -416,6 +484,11 @@ HTML_PAGE = """<!DOCTYPE html>
       <label>Дата</label>
       <input type="date" id="datePicker">
     </div>
+    <div class="date-box">
+      <label>🔍</label>
+      <input type="text" id="searchBox" placeholder="Поиск по сотруднику..." style="border:none; font-size:14px; font-family:inherit; outline:none; min-width:180px;">
+    </div>
+    <button id="exportBtn" class="export-btn">⬇ Экспорт CSV</button>
     <div class="status" id="status"><span class="live-dot"></span>обновление...</div>
   </div>
 
@@ -433,6 +506,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <th>Звонков исход</th>
           <th>Закрыто успех</th>
           <th>Закрыто провал</th>
+          <th>План (месяц)</th>
           <th>Начало работы</th>
           <th>Перерыв</th>
           <th>Рекомендация</th>
@@ -470,6 +544,7 @@ function formatTime(iso) {
 }
 
 function render(data) {
+  window.__lastData = data; // для экспорта CSV
   document.getElementById('subtitle').innerText = `воронка «${data.category_name}»`;
   document.getElementById('status').innerHTML =
     `<span class="live-dot"></span>сделки: ${data.last_slow_update || '—'} · звонки/закрытые: ${data.last_fast_update || '—'}`;
@@ -491,6 +566,10 @@ function render(data) {
   if (data.no_split) {
     banners.innerHTML += `<div class="warning-banner">⚠️ Не удалось разделить звонки на входящие/исходящие (не хватает права «Телефония» у вебхука) — все звонки показаны в столбце «исход».</div>`;
   }
+  const overLimitPeople = data.rows.filter(r => r.plan_lost > data.monthly_plan_half);
+  if (overLimitPeople.length > 0) {
+    banners.innerHTML += `<div class="warning-banner">🔴 У ${overLimitPeople.length} сотрудник(ов) провалов за месяц уже больше нормы (${data.monthly_plan_half} из плана ${data.monthly_plan_target}) — конверсия ниже допустимой: ${overLimitPeople.map(r=>r.name).join(', ')}</div>`;
+  }
 
   const totalDeals = data.rows.reduce((s,r) => s + r.active_deals, 0);
   const totalCalls = data.rows.reduce((s,r) => s + r.calls_in + r.calls_out, 0);
@@ -505,22 +584,50 @@ function render(data) {
     <div class="stat-card red"><div class="num">${totalLost}</div><div class="label">Закрыто провал</div></div>
   `;
 
+  renderTable(data);
+}
+
+function renderTable(data) {
+  const query = document.getElementById('searchBox').value.trim().toLowerCase();
+  const filteredRows = query ? data.rows.filter(r => r.name.toLowerCase().includes(query)) : data.rows;
+
   const tbody = document.getElementById('tbody');
   tbody.innerHTML = '';
-  data.rows.forEach((r, i) => {
+  filteredRows.forEach((r, i) => {
     const tr = document.createElement('tr');
     if (i < data.low_load_top_n) tr.className = 'low-load';
-    const dash = v => v ? v : '<span class="empty-cell">—</span>';
     const workStart = formatTime(r.work_start);
     const breakTime = formatTime(r.break_time);
     const fmt = t => t.text ? (t.stale ? `<span class="stale" title="Не сегодня">${t.text}</span>` : t.text) : '<span class="empty-cell">—</span>';
+
+    const nameHtml = r.crm_link
+      ? `<a class="name-link" href="${r.crm_link}" target="_blank" title="Открыть сделки в Bitrix24">${r.name} ↗</a>`
+      : r.name;
+
+    const planTotal = r.plan_total || 0;
+    const planPct = Math.min(100, Math.round((planTotal / data.monthly_plan_target) * 100));
+    const wonPct = planTotal ? (r.plan_won / data.monthly_plan_target) * 100 : 0;
+    const lostPct = planTotal ? (r.plan_lost / data.monthly_plan_target) * 100 : 0;
+    const overLimit = r.plan_lost > data.monthly_plan_half;
+    const dupBadge = r.duplicate_clients > 0
+      ? `<span class="dup-badge" title="${r.duplicate_clients} клиент(ов) с несколькими закрытыми сделками — возможен задвоенный учёт">⚠ ${r.duplicate_clients} дубл.</span>`
+      : '';
+    const planHtml = `
+      <div class="plan-bar">
+        <div class="won-part" style="width:${wonPct}%"></div>
+        <div class="lost-part" style="width:${lostPct}%"></div>
+      </div>
+      <div class="plan-label">${planTotal}/${data.monthly_plan_target} · <span class="${overLimit ? 'over-limit' : ''}">${r.plan_won} усп / ${r.plan_lost} пров</span>${dupBadge}</div>
+    `;
+
     tr.innerHTML = `
-      <td class="name-cell">${r.name}</td>
+      <td class="name-cell">${nameHtml}</td>
       <td class="num-cell">${r.active_deals}</td>
       <td class="num-cell in-call">${r.calls_in || 0}</td>
       <td class="num-cell out-call">${r.calls_out || 0}</td>
       <td class="num-cell won">${r.closed_won || 0}</td>
       <td class="num-cell lost">${r.closed_lost || 0}</td>
+      <td class="plan-cell">${planHtml}</td>
       <td>${fmt(workStart)}</td>
       <td>${fmt(breakTime)}</td>
       <td>${i < data.low_load_top_n ? '<span class="badge rec">Можно догрузить</span>' : ''}</td>
@@ -529,6 +636,31 @@ function render(data) {
   });
 }
 
+function exportCSV() {
+  const data = window.__lastData;
+  if (!data) return;
+  const query = document.getElementById('searchBox').value.trim().toLowerCase();
+  const rows = query ? data.rows.filter(r => r.name.toLowerCase().includes(query)) : data.rows;
+  const headers = ['Сотрудник','Сделок в работе','Звонков вход','Звонков исход','Закрыто успех','Закрыто провал','План всего','План успех','План провал','Дублей клиентов','Начало работы','Перерыв'];
+  const lines = [headers.join(';')];
+  rows.forEach(r => {
+    lines.push([
+      r.name, r.active_deals, r.calls_in||0, r.calls_out||0, r.closed_won||0, r.closed_lost||0,
+      r.plan_total||0, r.plan_won||0, r.plan_lost||0, r.duplicate_clients||0,
+      r.work_start||'', r.break_time||''
+    ].join(';'));
+  });
+  const blob = new Blob(["\uFEFF" + lines.join('\n')], {type: 'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `активность_сотрудников_${datePicker.value}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById('searchBox').addEventListener('input', () => renderTable(window.__lastData));
+document.getElementById('exportBtn').addEventListener('click', exportCSV);
 datePicker.addEventListener('change', loadData);
 loadData();
 setInterval(loadData, 20000); // обновление раз в 20 секунд
@@ -568,6 +700,7 @@ class Handler(BaseHTTPRequestHandler):
             users_by_id = dict(STATE["users_by_id"])
             active_deals = dict(STATE["active_deals"])
             attendance = dict(STATE["attendance"])
+            monthly_plan = dict(STATE["monthly_plan"])
             category_name = STATE["category_name"]
             last_slow = STATE["last_slow_update"]
             last_fast = STATE["last_fast_update"]
@@ -603,6 +736,8 @@ class Handler(BaseHTTPRequestHandler):
 
         is_today = date_str == datetime.now().strftime("%Y-%m-%d")
 
+        crm_base = f"https://{PORTAL_DOMAIN}/crm/deal/list/?apply_filter=Y&FILTER%5BASSIGNED_BY_ID%5D%5B0%5D=" if PORTAL_DOMAIN else None
+
         rows = []
         for uid, name in users_by_id.items():
             ad = active_deals.get(uid, 0)
@@ -611,7 +746,8 @@ class Handler(BaseHTTPRequestHandler):
             cw = won.get(uid, 0)
             cl = lost.get(uid, 0)
             att = attendance.get(uid, {}) if is_today else {}
-            if ad or ci or co or cw or cl:
+            plan = monthly_plan.get(uid, {"won": 0, "lost": 0, "total": 0, "duplicate_clients": 0})
+            if ad or ci or co or cw or cl or plan["total"]:
                 rows.append({
                     "name": name,
                     "active_deals": ad,
@@ -621,6 +757,11 @@ class Handler(BaseHTTPRequestHandler):
                     "closed_lost": cl,
                     "work_start": att.get("start", ""),
                     "break_time": att.get("break", ""),
+                    "plan_won": plan["won"],
+                    "plan_lost": plan["lost"],
+                    "plan_total": plan["total"],
+                    "duplicate_clients": plan["duplicate_clients"],
+                    "crm_link": (crm_base + str(uid)) if crm_base else None,
                 })
 
         rows.sort(key=lambda r: r["active_deals"])
@@ -635,6 +776,8 @@ class Handler(BaseHTTPRequestHandler):
             "calls_loading": calls_loading,
             "call_error": fast_entry.get("call_error"),
             "closed_error": fast_entry.get("closed_error"),
+            "monthly_plan_target": MONTHLY_PLAN,
+            "monthly_plan_half": MONTHLY_PLAN // 2,
             "rows": rows,
         }
 
@@ -650,6 +793,10 @@ def main():
     if not WEBHOOK_URL:
         print("ОШИБКА: не задан вебхук. Передайте --webhook или переменную окружения BITRIX_WEBHOOK_URL.")
         sys.exit(1)
+
+    global PORTAL_DOMAIN
+    m = re.match(r"https?://([^/]+)", WEBHOOK_URL)
+    PORTAL_DOMAIN = m.group(1) if m else None
 
     port = args.port or int(os.environ.get("PORT", 8000))
 
