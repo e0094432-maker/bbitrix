@@ -215,28 +215,83 @@ def fetch_monthly_plan_stats(category_id):
 
 
 def fetch_calls_split(day_start, day_end):
-    """Звонки за период, разбитые на входящие/исходящие, по ответственному.
-    ВРЕМЕННО ОТКЛЮЧЕНО: voximplant.statistic.get не фильтруется по дате
-    корректно (возвращает всю историю), из-за чего дашборд зависал.
-    Пока считаем все звонки одним числом через обычные CRM-активности —
-    надёжно и быстро. Разделение на вход/исход доделаем отдельно."""
-    items2, error2 = get_all_pages(
-        "crm.activity.list",
+    """Звонки за период: входящие/исходящие, по ответственному, плюс список
+    отдельных звонков с деталями (для показа по клику) и пометкой неудачных.
+
+    ВАЖНО: правильные ключи фильтра для voximplant.statistic.get —
+    'CALL_START_DATE_from' / 'CALL_START_DATE_to' (с маленькой from/to).
+    Раньше здесь стояли FROM/TO заглавными — фильтр не срабатывал вообще,
+    и Bitrix24 отдавал всю историю целиком, из-за чего дашборд зависал.
+    """
+    items, error = get_all_pages(
+        "voximplant.statistic.get",
         {
-            "filter[TYPE_ID]": 2,
-            "filter[>=CREATED]": day_start,
-            "filter[<CREATED]": day_end,
-            "select[]": ["RESPONSIBLE_ID"],
+            "FILTER[CALL_START_DATE_from]": day_start,
+            "FILTER[CALL_START_DATE_to]": day_end,
+            "SORT": "CALL_START_DATE",
+            "ORDER": "DESC",
         },
+        max_pages=200,
     )
-    if error2:
-        return {}, {}, error2
+
+    if error:
+        print(f"[!] voximplant.statistic.get недоступен ({error}) — считаю звонки без разделения через CRM-активности.")
+        items2, error2 = get_all_pages(
+            "crm.activity.list",
+            {
+                "filter[TYPE_ID]": 2,
+                "filter[>=CREATED]": day_start,
+                "filter[<CREATED]": day_end,
+                "select[]": ["RESPONSIBLE_ID"],
+            },
+        )
+        if error2:
+            return {}, {}, {}, error2
+        outgoing = {}
+        for item in items2 or []:
+            uid = item.get("RESPONSIBLE_ID")
+            if uid:
+                outgoing[uid] = outgoing.get(uid, 0) + 1
+        return {}, outgoing, {}, "no_split"
+
+    incoming = {}
     outgoing = {}
-    for item in items2 or []:
-        uid = item.get("RESPONSIBLE_ID")
-        if uid:
+    calls_by_user = {}  # uid -> list of call dicts (для показа деталей по клику)
+
+    for item in items or []:
+        uid = item.get("PORTAL_USER_ID")
+        if not uid:
+            continue
+        call_type = str(item.get("CALL_TYPE", ""))
+        failed_code = str(item.get("CALL_FAILED_CODE", "0"))
+        duration = item.get("CALL_DURATION", "0")
+        try:
+            duration = int(duration)
+        except (ValueError, TypeError):
+            duration = 0
+        is_failed = failed_code != "0" or duration == 0
+
+        if call_type == "2":
+            incoming[uid] = incoming.get(uid, 0) + 1
+        else:
             outgoing[uid] = outgoing.get(uid, 0) + 1
-    return {}, outgoing, "no_split"  # всё свалено в "исходящие" с пометкой
+
+        entity_id = item.get("CRM_ENTITY_ID")
+        entity_type = str(item.get("CRM_ENTITY_TYPE", ""))
+        deal_link = None
+        if entity_id and entity_type.upper() in ("DEAL", "3", "CRM_DEAL"):
+            deal_link = f"https://{PORTAL_DOMAIN}/crm/deal/details/{entity_id}/" if PORTAL_DOMAIN else None
+
+        calls_by_user.setdefault(uid, []).append({
+            "time": item.get("CALL_START_DATE", ""),
+            "direction": "in" if call_type == "2" else "out",
+            "duration": duration,
+            "failed": is_failed,
+            "phone": item.get("PHONE_NUMBER", ""),
+            "deal_link": deal_link,
+        })
+
+    return incoming, outgoing, calls_by_user, None
 
 
 def fetch_closed_split(day_start, day_end):
@@ -358,14 +413,20 @@ def fast_refresh_for_date(date_str):
     day_start = f"{date_str}T00:00:00"
     day_end = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
 
-    incoming, outgoing, call_err = fetch_calls_split(day_start, day_end)
+    incoming, outgoing, calls_by_user, call_err = fetch_calls_split(day_start, day_end)
     won, lost, closed_err = fetch_closed_split(day_start, day_end)
+
+    bad_calls = {}
+    for uid, calls in calls_by_user.items():
+        bad_calls[uid] = sum(1 for c in calls if c["failed"])
 
     entry = {
         "in": incoming,
         "out": outgoing,
         "won": won,
         "lost": lost,
+        "calls_detail": calls_by_user,
+        "bad_calls": bad_calls,
         "no_split": call_err == "no_split",
         "call_error": call_err if call_err != "no_split" else None,
         "closed_error": closed_err,
@@ -373,7 +434,8 @@ def fast_refresh_for_date(date_str):
     with STATE_LOCK:
         STATE["fast_cache"][date_str] = entry
         STATE["last_fast_update"] = datetime.now().strftime("%H:%M:%S")
-    print(f"[fast refresh] {date_str} — звонков вход:{sum(incoming.values())} исход:{sum(outgoing.values())} успех:{sum(won.values())} провал:{sum(lost.values())}")
+    total_bad = sum(bad_calls.values())
+    print(f"[fast refresh] {date_str} — звонков вход:{sum(incoming.values())} исход:{sum(outgoing.values())} (плохих:{total_bad}) успех:{sum(won.values())} провал:{sum(lost.values())}")
 
 
 def fast_refresh_loop():
@@ -469,6 +531,37 @@ HTML_PAGE = """<!DOCTYPE html>
   .plan-label { font-size: 11.5px; color: var(--muted); }
   .plan-label .over-limit { color: var(--red); font-weight: 700; }
   .dup-badge { font-size: 10.5px; color: var(--amber); margin-left: 4px; cursor: help; }
+
+  .leaderboard { display: flex; gap: 14px; margin-bottom: 22px; flex-wrap: wrap; }
+  .lb-card { background: white; border-radius: 14px; padding: 14px 20px; flex: 1; min-width: 200px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+  .lb-card .medal { font-size: 28px; }
+  .lb-card .lb-name { font-weight: 700; font-size: 14px; }
+  .lb-card .lb-pct { font-size: 13px; color: var(--green); font-weight: 700; }
+  .lb-card.gold { border-color: #fbbf24; background: linear-gradient(135deg, #fffbeb, white); }
+  .lb-card.silver { border-color: #cbd5e1; }
+  .lb-card.bronze { border-color: #fb923c33; }
+
+  .plan-status { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; display: inline-block; margin-bottom: 3px; }
+  .plan-status.done { background: var(--green-light); color: var(--green); }
+  .plan-status.pending { background: #f1f5f9; color: var(--muted); }
+  .plan-status.danger { background: var(--red-light); color: var(--red); }
+  .plan-period { font-size: 10px; color: var(--muted); }
+  .calls-clickable { cursor: pointer; text-decoration: underline dotted; }
+  .calls-clickable:hover { color: var(--accent); }
+  .bad-call-num { color: var(--red); font-weight: 600; }
+
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+  .modal-box { background: white; border-radius: 14px; width: 520px; max-width: 92vw; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column; }
+  .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  .modal-header h3 { margin: 0; font-size: 16px; }
+  .modal-close { background: none; border: none; font-size: 18px; cursor: pointer; color: var(--muted); }
+  .modal-body { padding: 12px 20px; overflow-y: auto; }
+  .call-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
+  .call-row .call-dir { width: 18px; text-align: center; }
+  .call-row .call-time { color: var(--muted); width: 60px; }
+  .call-row .call-dur { width: 50px; }
+  .call-row.failed { color: var(--red); }
+  .call-row a { color: var(--accent); text-decoration: none; margin-left: auto; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -494,6 +587,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <div id="banners"></div>
 
+  <div class="leaderboard" id="leaderboard"></div>
+
   <div class="stats-row" id="statsRow"></div>
 
   <div class="table-card">
@@ -504,9 +599,10 @@ HTML_PAGE = """<!DOCTYPE html>
           <th>Сделок в работе</th>
           <th>Звонков вход</th>
           <th>Звонков исход</th>
+          <th>Плохих звонков</th>
           <th>Закрыто успех</th>
           <th>Закрыто провал</th>
-          <th>План (месяц)</th>
+          <th id="planHeader">План (месяц)</th>
           <th>Начало работы</th>
           <th>Перерыв</th>
           <th>Рекомендация</th>
@@ -514,6 +610,16 @@ HTML_PAGE = """<!DOCTYPE html>
       </thead>
       <tbody id="tbody"></tbody>
     </table>
+  </div>
+
+  <div id="callsModalOverlay" class="modal-overlay" style="display:none;">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="callsModalTitle">Звонки</h3>
+        <button id="callsModalClose" class="modal-close">✕</button>
+      </div>
+      <div id="callsModalBody" class="modal-body"></div>
+    </div>
   </div>
 
 <script>
@@ -544,8 +650,9 @@ function formatTime(iso) {
 }
 
 function render(data) {
-  window.__lastData = data; // для экспорта CSV
+  window.__lastData = data; // для экспорта CSV и модалки звонков
   document.getElementById('subtitle').innerText = `воронка «${data.category_name}»`;
+  document.getElementById('planHeader').innerText = `План (${data.plan_period_label})`;
   document.getElementById('status').innerHTML =
     `<span class="live-dot"></span>сделки: ${data.last_slow_update || '—'} · звонки/закрытые: ${data.last_fast_update || '—'}`;
 
@@ -571,8 +678,27 @@ function render(data) {
     banners.innerHTML += `<div class="warning-banner">🔴 У ${overLimitPeople.length} сотрудник(ов) провалов за месяц уже больше нормы (${data.monthly_plan_half} из плана ${data.monthly_plan_target}) — конверсия ниже допустимой: ${overLimitPeople.map(r=>r.name).join(', ')}</div>`;
   }
 
+  const medals = ['🥇','🥈','🥉'];
+  const medalClass = ['gold','silver','bronze'];
+  const lb = document.getElementById('leaderboard');
+  if (data.leaderboard && data.leaderboard.length) {
+    lb.innerHTML = data.leaderboard.map((r,i) => {
+      const pct = Math.round((r.plan_total / data.monthly_plan_target) * 100);
+      return `<div class="lb-card ${medalClass[i]}">
+        <div class="medal">${medals[i]}</div>
+        <div>
+          <div class="lb-name">${r.name}</div>
+          <div class="lb-pct">${pct}% плана (${r.plan_total}/${data.monthly_plan_target})</div>
+        </div>
+      </div>`;
+    }).join('');
+  } else {
+    lb.innerHTML = '';
+  }
+
   const totalDeals = data.rows.reduce((s,r) => s + r.active_deals, 0);
   const totalCalls = data.rows.reduce((s,r) => s + r.calls_in + r.calls_out, 0);
+  const totalBad = data.rows.reduce((s,r) => s + (r.bad_calls||0), 0);
   const totalWon = data.rows.reduce((s,r) => s + r.closed_won, 0);
   const totalLost = data.rows.reduce((s,r) => s + r.closed_lost, 0);
 
@@ -580,6 +706,7 @@ function render(data) {
     <div class="stat-card accent"><div class="num">${data.rows.length}</div><div class="label">Сотрудников в работе</div></div>
     <div class="stat-card accent"><div class="num">${totalDeals}</div><div class="label">Сделок в работе всего</div></div>
     <div class="stat-card"><div class="num">${totalCalls}</div><div class="label">Звонков за день</div></div>
+    <div class="stat-card red"><div class="num">${totalBad}</div><div class="label">Плохих звонков</div></div>
     <div class="stat-card green"><div class="num">${totalWon}</div><div class="label">Закрыто успешно</div></div>
     <div class="stat-card red"><div class="num">${totalLost}</div><div class="label">Закрыто провал</div></div>
   `;
@@ -605,26 +732,44 @@ function renderTable(data) {
       : r.name;
 
     const planTotal = r.plan_total || 0;
-    const planPct = Math.min(100, Math.round((planTotal / data.monthly_plan_target) * 100));
     const wonPct = planTotal ? (r.plan_won / data.monthly_plan_target) * 100 : 0;
     const lostPct = planTotal ? (r.plan_lost / data.monthly_plan_target) * 100 : 0;
     const overLimit = r.plan_lost > data.monthly_plan_half;
+    const planDone = planTotal >= data.monthly_plan_target;
     const dupBadge = r.duplicate_clients > 0
       ? `<span class="dup-badge" title="${r.duplicate_clients} клиент(ов) с несколькими закрытыми сделками — возможен задвоенный учёт">⚠ ${r.duplicate_clients} дубл.</span>`
       : '';
+    const statusBadge = planDone
+      ? '<span class="plan-status done">✅ План выполнен</span>'
+      : overLimit
+        ? '<span class="plan-status danger">⚠️ Провалов больше нормы</span>'
+        : '<span class="plan-status pending">В процессе</span>';
     const planHtml = `
+      ${statusBadge}
       <div class="plan-bar">
         <div class="won-part" style="width:${wonPct}%"></div>
         <div class="lost-part" style="width:${lostPct}%"></div>
       </div>
-      <div class="plan-label">${planTotal}/${data.monthly_plan_target} · <span class="${overLimit ? 'over-limit' : ''}">${r.plan_won} усп / ${r.plan_lost} пров</span>${dupBadge}</div>
+      <div class="plan-label">${planTotal}/${data.monthly_plan_target} · ${r.plan_won} усп / ${r.plan_lost} пров${dupBadge}</div>
     `;
+
+    const totalCallsRow = (r.calls_in || 0) + (r.calls_out || 0);
+    const callsInHtml = r.calls_in
+      ? `<span class="calls-clickable" onclick="openCallsModal('${r.name.replace(/'/g,"\\'")}', 'in')">${r.calls_in}</span>`
+      : '0';
+    const callsOutHtml = r.calls_out
+      ? `<span class="calls-clickable" onclick="openCallsModal('${r.name.replace(/'/g,"\\'")}', 'out')">${r.calls_out}</span>`
+      : '0';
+    const badHtml = r.bad_calls
+      ? `<span class="bad-call-num calls-clickable" onclick="openCallsModal('${r.name.replace(/'/g,"\\'")}', 'bad')">${r.bad_calls}</span>`
+      : '0';
 
     tr.innerHTML = `
       <td class="name-cell">${nameHtml}</td>
       <td class="num-cell">${r.active_deals}</td>
-      <td class="num-cell in-call">${r.calls_in || 0}</td>
-      <td class="num-cell out-call">${r.calls_out || 0}</td>
+      <td class="num-cell in-call">${callsInHtml}</td>
+      <td class="num-cell out-call">${callsOutHtml}</td>
+      <td class="num-cell">${badHtml}</td>
       <td class="num-cell won">${r.closed_won || 0}</td>
       <td class="num-cell lost">${r.closed_lost || 0}</td>
       <td class="plan-cell">${planHtml}</td>
@@ -635,6 +780,52 @@ function renderTable(data) {
     tbody.appendChild(tr);
   });
 }
+
+function openCallsModal(employeeName, filterType) {
+  const data = window.__lastData;
+  if (!data) return;
+  const row = data.rows.find(r => r.name === employeeName);
+  if (!row) return;
+
+  let calls = row.calls_list || [];
+  if (filterType === 'in') calls = calls.filter(c => c.direction === 'in');
+  if (filterType === 'out') calls = calls.filter(c => c.direction === 'out');
+  if (filterType === 'bad') calls = calls.filter(c => c.failed);
+
+  const titleMap = {in: 'входящие звонки', out: 'исходящие звонки', bad: 'плохие звонки'};
+  document.getElementById('callsModalTitle').innerText = `${employeeName} — ${titleMap[filterType] || 'звонки'}`;
+
+  const body = document.getElementById('callsModalBody');
+  if (!calls.length) {
+    body.innerHTML = '<p style="color:#94a3b8;">Нет данных по этим звонкам.</p>';
+  } else {
+    body.innerHTML = calls.map(c => {
+      const time = (c.time || '').replace('T', ' ').slice(0, 16);
+      const dirIcon = c.direction === 'in' ? '↓' : '↑';
+      const durMin = Math.floor(c.duration / 60);
+      const durSec = c.duration % 60;
+      const durText = c.duration ? `${durMin}:${String(durSec).padStart(2,'0')}` : '0:00';
+      const link = c.deal_link ? `<a href="${c.deal_link}" target="_blank">Открыть сделку ↗</a>` : '';
+      return `<div class="call-row ${c.failed ? 'failed' : ''}">
+        <span class="call-dir">${dirIcon}</span>
+        <span class="call-time">${time}</span>
+        <span class="call-dur">${durText}</span>
+        <span>${c.phone || ''}</span>
+        ${c.failed ? '<span title="Неудачный звонок">⚠️</span>' : ''}
+        ${link}
+      </div>`;
+    }).join('');
+  }
+
+  document.getElementById('callsModalOverlay').style.display = 'flex';
+}
+
+document.getElementById('callsModalClose').addEventListener('click', () => {
+  document.getElementById('callsModalOverlay').style.display = 'none';
+});
+document.getElementById('callsModalOverlay').addEventListener('click', (e) => {
+  if (e.target.id === 'callsModalOverlay') e.target.style.display = 'none';
+});
 
 function exportCSV() {
   const data = window.__lastData;
@@ -733,6 +924,8 @@ class Handler(BaseHTTPRequestHandler):
         won = fast_entry.get("won", {})
         lost = fast_entry.get("lost", {})
         no_split = fast_entry.get("no_split", False)
+        calls_detail = fast_entry.get("calls_detail", {})
+        bad_calls = fast_entry.get("bad_calls", {})
 
         is_today = date_str == datetime.now().strftime("%Y-%m-%d")
 
@@ -747,12 +940,14 @@ class Handler(BaseHTTPRequestHandler):
             cl = lost.get(uid, 0)
             att = attendance.get(uid, {}) if is_today else {}
             plan = monthly_plan.get(uid, {"won": 0, "lost": 0, "total": 0, "duplicate_clients": 0})
+            bad = bad_calls.get(uid, 0)
             if ad or ci or co or cw or cl or plan["total"]:
                 rows.append({
                     "name": name,
                     "active_deals": ad,
                     "calls_in": ci,
                     "calls_out": co,
+                    "bad_calls": bad,
                     "closed_won": cw,
                     "closed_lost": cl,
                     "work_start": att.get("start", ""),
@@ -762,9 +957,23 @@ class Handler(BaseHTTPRequestHandler):
                     "plan_total": plan["total"],
                     "duplicate_clients": plan["duplicate_clients"],
                     "crm_link": (crm_base + str(uid)) if crm_base else None,
+                    "calls_list": calls_detail.get(uid, []),
                 })
 
         rows.sort(key=lambda r: r["active_deals"])
+
+        # план начинается 1-го числа месяца, до 1-го числа следующего
+        now = datetime.now()
+        month_names = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"]
+        next_month = now.month % 12 + 1
+        next_month_year = now.year + (1 if now.month == 12 else 0)
+        plan_period_label = f"1 {month_names[now.month-1]} – 1 {month_names[next_month-1]}"
+
+        leaderboard = sorted(
+            [r for r in rows if r["plan_total"] > 0],
+            key=lambda r: r["plan_total"] / MONTHLY_PLAN,
+            reverse=True,
+        )[:3]
 
         return {
             "category_name": category_name,
@@ -776,6 +985,8 @@ class Handler(BaseHTTPRequestHandler):
             "calls_loading": calls_loading,
             "call_error": fast_entry.get("call_error"),
             "closed_error": fast_entry.get("closed_error"),
+            "plan_period_label": plan_period_label,
+            "leaderboard": leaderboard,
             "monthly_plan_target": MONTHLY_PLAN,
             "monthly_plan_half": MONTHLY_PLAN // 2,
             "rows": rows,
