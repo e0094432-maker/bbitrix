@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Живой дашборд активности сотрудников. Локальный веб-сервер: открываете
-страницу в браузере один раз и оставляете открытой — данные обновляются
-сами в фоне, без перезапуска скрипта.
+Дашборд активности сотрудников. Локальный/облачный веб-сервис.
 
 КАК ЗАПУСТИТЬ:
-  python live_dashboard.py --webhook "https://ваш-портал.bitrix24.kz/rest/USER/CODE/"
+  python app.py --webhook "https://ваш-портал.bitrix24.kz/rest/USER/CODE/"
+  (или переменные окружения BITRIX_WEBHOOK_URL и PORT — так работает на Render)
 
-Затем откройте в браузере: http://localhost:8000
+ДВЕ ВКЛАДКИ:
+  - Сводка: по каждому сотруднику — сколько сделок в работе сейчас,
+    сколько закрыто (успех/провал) за выбранный период, конверсия.
+    Клик по сотруднику — разбивка его активных сделок по стадиям.
+  - Звонки: список звонков за период, фильтр по сотруднику и
+    успех/провал, поиск по номеру, ссылка на сделку в Bitrix24.
 
-ЧТО ПОКАЗЫВАЕТ:
-  - Сделок в работе сейчас (только воронка "Досудебный отдел")
-  - Звонков сегодня: входящие / исходящие отдельно
-  - Закрыто сделок: успех / провал отдельно
-  - Начало работы / уход на перерыв (модуль учёта рабочего времени, только
-    для сегодняшней даты — за прошлые дни Bitrix24 не всегда отдаёт эти
-    данные через API)
-  - Можно выбрать другую дату вверху страницы (для звонков и закрытых
-    сделок; "сделок в работе" и время прихода — это всегда "сейчас",
-    задним числом не пересчитываются)
-
-ЕСЛИ ЧТО-ТО НЕ РАБОТАЕТ:
-  Если звонки/время прихода не показываются — скорее всего, у вебхука не
-  хватает прав "Телефония (telephony)" и/или "Учёт рабочего времени
-  (timeman)". Добавьте их так же, как добавляли "Структура компании" —
-  Разработчикам → Другое → ваш вебхук → отметить галочки → Сохранить.
-  Скрипт покажет в консоли, какой именно запрос не прошёл.
+ВЫБОР ПЕРИОДА: кнопки-пресеты (Сегодня/Вчера/Неделя/Месяц) + два поля
+для ручного выбора дат — применяется к обеим вкладкам сразу.
 """
 
 import argparse
@@ -44,22 +33,17 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-REQUEST_DELAY = 0.25
-MAX_RETRIES = 3
 CATEGORY_NAME = "Досудебный отдел"
-MONTHLY_PLAN = 660  # план закрытых сделок на месяц на каждого сотрудника
-PORTAL_DOMAIN = None  # определяется из webhook при запуске, для ссылок в CRM
 MATCH_THRESHOLD = 0.55
+REQUEST_DELAY = 0.3
+MAX_RETRIES = 6
 
-SLOW_REFRESH_SECONDS = 300   # активные сделки + время прихода — раз в 5 минут
-FAST_REFRESH_SECONDS = 45    # звонки + закрытые сделки за выбранную дату — чаще
-PLAN_REFRESH_SECONDS = 180   # обновление плана за выбранный период — раз в 3 минуты
-LOW_LOAD_TOP_N = 5
-ACTIVE_DEALS_WORKERS = 10    # сколько сотрудников опрашивать параллельно (ускоряет медленный шаг)
+SLOW_REFRESH_SECONDS = 300     # активные сделки "сейчас" + время прихода — раз в 5 минут
+RANGE_REFRESH_SECONDS = 120    # звонки/закрытые за выбранный период — раз в 2 минуты
+ACTIVE_DEALS_WORKERS = 6       # параллельных запросов при подсчёте активных сделок (снижено, чтобы не ловить 429)
 
-WEBHOOK_URL = None  # заполняется при запуске
-VOXIMPLANT_AVAILABLE = None  # None = ещё не проверяли, True/False = уже знаем
-TIMEMAN_AVAILABLE = None
+WEBHOOK_URL = None
+PORTAL_DOMAIN = None
 
 
 # ---------------------------------------------------------------------------
@@ -78,18 +62,21 @@ def call_bitrix(method, params):
                 if "error" in result:
                     err_code = str(result.get("error", ""))
                     err_desc = result.get("error_description", err_code)
-                    if err_code == "QUERY_LIMIT_EXCEEDED":
-                        time.sleep(2)
+                    if err_code in ("QUERY_LIMIT_EXCEEDED", "OPERATION_TIME_LIMIT"):
+                        time.sleep(3 + attempt * 2)
                         continue
                     if err_code in ("INSUFFICIENT_SCOPE", "ERROR_METHOD_NOT_FOUND", "NOT_FOUND") or "insufficient_scope" in str(err_desc).lower():
-                        return None, None, err_desc  # постоянная ошибка — повторять бессмысленно
+                        return None, None, err_desc
                     return None, None, err_desc
                 return result.get("result"), result.get("total"), None
         except urllib.error.HTTPError as e:
             body_text = e.read().decode("utf-8", errors="ignore")
             last_error = f"HTTP {e.code}: {body_text}"
+            if e.code == 429 or "operation_time_limit" in body_text.lower() or "query_limit_exceeded" in body_text.lower():
+                time.sleep(3 + attempt * 2)
+                continue
             if "insufficient_scope" in body_text.lower() or "method_not_found" in body_text.lower() or e.code == 401 or e.code == 404:
-                return None, None, last_error  # постоянная ошибка — повторять бессмысленно
+                return None, None, last_error
             time.sleep(1.0 * attempt)
         except Exception as e:
             last_error = str(e)
@@ -98,9 +85,6 @@ def call_bitrix(method, params):
 
 
 def get_all_pages(method, params, max_pages=200):
-    """max_pages — защита от зависания: если фильтр случайно не сработал
-    и метод пытается отдать огромную историю целиком, остановимся сами
-    вместо того чтобы висеть бесконечно (200 страниц = до 10 000 записей)."""
     all_items = []
     start = 0
     pages = 0
@@ -120,10 +104,29 @@ def get_all_pages(method, params, max_pages=200):
         if len(result) == 0:
             break
         if pages >= max_pages:
-            print(f"[!] {method}: достигнут лимит {max_pages} страниц ({len(all_items)} записей) — останавливаюсь, чтобы не зависнуть. Возможно, фильтр не сработал как ожидалось.")
+            print(f"[!] {method}: достигнут лимит {max_pages} страниц ({len(all_items)} записей) — останавливаюсь.")
             break
         start += 50
     return all_items, None
+
+
+def fetch_all_users():
+    all_users = []
+    seen_ids = set()
+    for active_filter in ({"ACTIVE": "Y"},):
+        params = dict(active_filter)
+        params["ADMIN_MODE"] = "Y"
+        users, error = get_all_pages("user.get", params)
+        if error:
+            users, error = get_all_pages("user.get", active_filter)
+        if error:
+            print(f"[ОШИБКА] user.get: {error}")
+            continue
+        for u in users or []:
+            if u["ID"] not in seen_ids:
+                seen_ids.add(u["ID"])
+                all_users.append(u)
+    return all_users
 
 
 def full_name(user):
@@ -131,14 +134,9 @@ def full_name(user):
     return " ".join(p for p in parts if p).strip()
 
 
-def fetch_all_users():
-    users, error = get_all_pages("user.get", {"ACTIVE": "Y", "ADMIN_MODE": "Y"})
-    if error:
-        users, error = get_all_pages("user.get", {"ACTIVE": "Y"})
-    if error:
-        print(f"[ОШИБКА] user.get: {error}")
-        return []
-    return users or []
+def is_active_user(user):
+    val = user.get("ACTIVE", "Y")
+    return str(val).strip().upper() in ("Y", "TRUE", "1")
 
 
 def find_deal_category_id():
@@ -159,6 +157,16 @@ def find_deal_category_id():
     return best_id, best_name
 
 
+def fetch_stages(category_id):
+    """Список стадий воронки в правильном порядке (STATUS_ID -> NAME)."""
+    stages, error = call_bitrix("crm.dealcategory.stage.list", {"id": category_id})
+    if error:
+        print(f"[ОШИБКА] crm.dealcategory.stage.list: {error}")
+        return {}
+    stages = sorted(stages or [], key=lambda s: int(s.get("SORT", 0)))
+    return {s["STATUS_ID"]: s["NAME"] for s in stages}
+
+
 def get_active_deal_count(user_id, category_id):
     result, total, error = call_bitrix(
         "crm.deal.list",
@@ -169,105 +177,115 @@ def get_active_deal_count(user_id, category_id):
     return (total if total is not None else len(result or [])), None
 
 
-def fetch_monthly_plan_stats(category_id, date_from_str, date_to_str):
-    """Закрытые сделки за ВЫБРАННЫЙ ПЕРИОД (план 660 на человека), с разбивкой
-    успех/провал и обнаружением дублей — когда у одного клиента (CONTACT_ID)
-    несколько закрытых сделок, это может означать задвоенный учёт.
-    date_from_str / date_to_str — строки 'YYYY-MM-DD'."""
-    period_start = f"{date_from_str}T00:00:00"
-    period_end = f"{date_to_str}T00:00:00"
-
-    items, error = get_all_pages(
+def fetch_employee_stage_breakdown(user_id, category_id, stage_names):
+    """Разбивка активных сделок ОДНОГО сотрудника по стадиям — считается
+    по клику, дёшево (один человек), поэтому можно делать "живьём"."""
+    deals, error = get_all_pages(
         "crm.deal.list",
-        {
-            "filter[CLOSED]": "Y",
-            "filter[>=CLOSEDATE]": period_start,
-            "filter[<CLOSEDATE]": period_end,
-            "filter[CATEGORY_ID]": category_id,
-            "select[]": ["ASSIGNED_BY_ID", "STAGE_SEMANTIC_ID", "CONTACT_ID"],
-        },
-        max_pages=400,
+        {"filter[ASSIGNED_BY_ID]": user_id, "filter[CLOSED]": "N", "filter[CATEGORY_ID]": category_id, "select[]": ["STAGE_ID"]},
+        max_pages=100,
     )
     if error:
-        return {}, error
-
-    per_user = {}  # uid -> {"won": n, "lost": n, "contacts": {contact_id: count}}
-    for item in items or []:
-        uid = item.get("ASSIGNED_BY_ID")
-        if not uid:
-            continue
-        bucket = per_user.setdefault(uid, {"won": 0, "lost": 0, "contacts": {}})
-        if item.get("STAGE_SEMANTIC_ID") == "S":
-            bucket["won"] += 1
-        else:
-            bucket["lost"] += 1
-        contact_id = item.get("CONTACT_ID")
-        if contact_id:
-            bucket["contacts"][contact_id] = bucket["contacts"].get(contact_id, 0) + 1
-
-    result = {}
-    for uid, b in per_user.items():
-        dup_count = sum(1 for c, n in b["contacts"].items() if n > 1)
-        result[uid] = {
-            "won": b["won"],
-            "lost": b["lost"],
-            "total": b["won"] + b["lost"],
-            "duplicate_clients": dup_count,
-        }
+        return [], error
+    counts = {}
+    for d in deals or []:
+        sid = d.get("STAGE_ID", "?")
+        counts[sid] = counts.get(sid, 0) + 1
+    result = [{"stage_id": sid, "stage_name": stage_names.get(sid, sid), "count": cnt} for sid, cnt in counts.items()]
+    result.sort(key=lambda x: -x["count"])
     return result, None
 
 
-def fetch_calls_split(day_start_dt, day_end_dt):
-    """Звонки за период: входящие/исходящие, по ответственному, плюс список
-    отдельных звонков с деталями (для показа по клику) и пометкой неудачных.
+def fetch_attendance_today(user_ids):
+    global TIMEMAN_AVAILABLE
+    if TIMEMAN_AVAILABLE is False:
+        return {}
+    result = {}
+    for uid in user_ids:
+        status, _, error = call_bitrix("timeman.status", {"USER_ID": uid})
+        if error:
+            if TIMEMAN_AVAILABLE is None:
+                print(f"[!] timeman.status недоступен ({error}). Пропускаю время прихода/перерыва для всех.")
+            TIMEMAN_AVAILABLE = False
+            return result
+        TIMEMAN_AVAILABLE = True
+        if isinstance(status, dict):
+            result[uid] = {
+                "start": status.get("TIME_START", "") or "",
+                "break": status.get("START_ENTRY", "") or status.get("BREAK_START", "") or "",
+            }
+        time.sleep(REQUEST_DELAY)
+    return result
 
-    ВАЖНО про формат даты: voximplant.statistic.get на некоторых порталах
-    (с региональными настройками ДД.ММ.ГГГГ) не понимает ISO-формат дат
-    (2026-09-02T00:00:00) и тогда просто игнорирует фильтр целиком, отдавая
-    всю историю звонков. Поэтому здесь используем формат ДД.ММ.ГГГГ ЧЧ:ММ:СС,
-    которого Bitrix24 в большинстве случаев ждёт для этого метода.
-    """
+
+TIMEMAN_AVAILABLE = None
+VOXIMPLANT_AVAILABLE = None
+
+
+def parse_bitrix_datetime(s):
+    """Парсит дату из ответа Bitrix24 (ISO или ДД.ММ.ГГГГ). Возвращает
+    naive datetime (без временной зоны) или None."""
+    if not s:
+        return None
+    s = str(s)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.replace(tzinfo=None)
+    except ValueError:
+        pass
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def fetch_calls_in_range(start_dt, end_dt):
+    """Звонки за произвольный период. НАДЁЖНЫЙ способ, не зависящий от
+    того, сработает ли фильтр Bitrix24 по дате: запрашиваем звонки от
+    новых к старым (ORDER=DESC) и сами останавливаемся, как только видим
+    звонок старше начала периода — дальше все звонки будут ещё старше."""
     date_fmt = "%d.%m.%Y %H:%M:%S"
-    day_start = day_start_dt.strftime(date_fmt)
-    day_end = day_end_dt.strftime(date_fmt)
+    calls = []
+    start_offset = 0
+    page_size = 50
+    max_iterations = 150
 
-    items, error = get_all_pages(
-        "voximplant.statistic.get",
-        {
-            "FILTER[CALL_START_DATE_from]": day_start,
-            "FILTER[CALL_START_DATE_to]": day_end,
+    for _ in range(max_iterations):
+        params = {
+            "FILTER[CALL_START_DATE_from]": start_dt.strftime(date_fmt),
+            "FILTER[CALL_START_DATE_to]": end_dt.strftime(date_fmt),
             "SORT": "CALL_START_DATE",
             "ORDER": "DESC",
-        },
-        max_pages=60,  # день реально не может содержать >3000 звонков; если упёрлись — фильтр снова не сработал
-    )
+            "start": start_offset,
+        }
+        result, total, error = call_bitrix("voximplant.statistic.get", params)
+        time.sleep(REQUEST_DELAY)
+        if error:
+            return None, error
+        if not result:
+            break
 
-    if error:
-        print(f"[!] voximplant.statistic.get недоступен ({error}) — считаю звонки без разделения через CRM-активности.")
-        items2, error2 = get_all_pages(
-            "crm.activity.list",
-            {
-                "filter[TYPE_ID]": 2,
-                "filter[>=CREATED]": day_start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "filter[<CREATED]": day_end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-                "select[]": ["RESPONSIBLE_ID"],
-            },
-        )
-        if error2:
-            return {}, {}, {}, error2
-        outgoing = {}
-        for item in items2 or []:
-            uid = item.get("RESPONSIBLE_ID")
-            if uid:
-                outgoing[uid] = outgoing.get(uid, 0) + 1
-        return {}, outgoing, {}, "no_split"
+        reached_lower_bound = False
+        for item in result:
+            item_dt = parse_bitrix_datetime(item.get("CALL_START_DATE"))
+            if item_dt is not None:
+                if item_dt < start_dt:
+                    reached_lower_bound = True
+                    break
+                if item_dt > end_dt:
+                    continue
+            calls.append(item)
 
-    incoming = {}
-    outgoing = {}
-    calls_by_user = {}  # uid -> list of call dicts (для показа деталей по клику)
+        if reached_lower_bound or len(result) < page_size:
+            break
+        start_offset += page_size
+    else:
+        print(f"[!] fetch_calls_in_range: достигнут защитный лимит {max_iterations} страниц")
 
-    out_of_range = 0
-    for item in items or []:
+    incoming, outgoing, calls_by_user = {}, {}, {}
+    for item in calls:
         uid = item.get("PORTAL_USER_ID")
         if not uid:
             continue
@@ -300,30 +318,27 @@ def fetch_calls_split(day_start_dt, day_end_dt):
             "deal_link": deal_link,
         })
 
-    if items and len(items) > 20:
-        # быстрая проверка: если много звонков вне запрошенного дня — фильтр не сработал
-        sample_date = str(items[0].get("CALL_START_DATE", ""))
-        if sample_date and day_start_dt.strftime("%Y-%m-%d") not in sample_date and day_start_dt.strftime("%d.%m.%Y") not in sample_date:
-            print(f"[!] ПОДОЗРЕНИЕ: фильтр по дате звонков не сработал — первая запись датирована '{sample_date}', а ожидался {day_start_dt.date()}")
-
-    return incoming, outgoing, calls_by_user, None
+    return {"incoming": incoming, "outgoing": outgoing, "calls_by_user": calls_by_user}, None
 
 
-def fetch_closed_split(day_start, day_end):
-    """Закрытые сделки за период, отдельно успех/провал, по ответственному."""
+def fetch_closed_in_range(category_id, date_from_str, date_to_str):
+    """Закрытые сделки (успех/провал) за период, по ответственному."""
+    period_start = f"{date_from_str}T00:00:00"
+    period_end = f"{date_to_str}T00:00:00"
     items, error = get_all_pages(
         "crm.deal.list",
         {
             "filter[CLOSED]": "Y",
-            "filter[>=CLOSEDATE]": day_start,
-            "filter[<CLOSEDATE]": day_end,
+            "filter[>=CLOSEDATE]": period_start,
+            "filter[<CLOSEDATE]": period_end,
+            "filter[CATEGORY_ID]": category_id,
             "select[]": ["ASSIGNED_BY_ID", "STAGE_SEMANTIC_ID"],
         },
+        max_pages=400,
     )
     if error:
-        return {}, {}, error
-    won = {}
-    lost = {}
+        return {}, error
+    won, lost = {}, {}
     for item in items or []:
         uid = item.get("ASSIGNED_BY_ID")
         if not uid:
@@ -332,60 +347,35 @@ def fetch_closed_split(day_start, day_end):
             won[uid] = won.get(uid, 0) + 1
         else:
             lost[uid] = lost.get(uid, 0) + 1
-    return won, lost, None
-
-
-def fetch_attendance_today(user_ids):
-    """Время начала работы / ухода на перерыв — только на сегодня."""
-    global TIMEMAN_AVAILABLE
-    if TIMEMAN_AVAILABLE is False:
-        return {}
-
-    result = {}
-    for i, uid in enumerate(user_ids):
-        status, _, error = call_bitrix("timeman.status", {"USER_ID": uid})
-        if error:
-            if TIMEMAN_AVAILABLE is None:
-                print(f"[!] timeman.status недоступен ({error}). Пропускаю время прихода/перерыва для всех — добавьте право 'Учёт рабочего времени (timeman)' в вебхук, если это нужно.")
-            TIMEMAN_AVAILABLE = False
-            return result  # прекращаем сразу, не тратим время на остальных
-        TIMEMAN_AVAILABLE = True
-        if isinstance(status, dict):
-            result[uid] = {
-                "start": status.get("TIME_START", "") or "",
-                "break": status.get("START_ENTRY", "") or status.get("BREAK_START", "") or "",
-            }
-        time.sleep(REQUEST_DELAY)
-    return result
+    return {"won": won, "lost": lost}, None
 
 
 # ---------------------------------------------------------------------------
-# Общее состояние (кэш), обновляемое фоновыми потоками
+# Общее состояние
 # ---------------------------------------------------------------------------
 STATE_LOCK = threading.Lock()
 STATE = {
-    "users_by_id": {},          # {uid: name}
+    "users_by_id": {},
     "category_name": "",
-    "active_deals": {},         # {uid: count} — обновляется медленно
-    "attendance": {},           # {uid: {"start":..,"break":..}} — только сегодня
     "category_id": None,
+    "stage_names": {},
+    "active_deals": {},
+    "attendance": {},
     "last_slow_update": None,
-    "last_fast_update": None,
-    "fast_cache": {},           # {date_str: {"in":{}, "out":{}, "won":{}, "lost":{}, "no_split":bool}}
-    "fast_in_progress": set(),  # даты, которые прямо сейчас считаются в фоне (чтобы не запускать повторно)
-    "plan_cache": {},           # {"from_to": {"data":..., "computed_at":...}}
-    "plan_in_progress": set(),
+    "range_cache": {},       # {"from_to": {"calls":..., "closed":..., "computed_at":..., "call_error":..., "closed_error":...}}
+    "range_in_progress": set(),
     "errors": [],
 }
-FAST_IN_PROGRESS_LOCK = threading.Lock()
-PLAN_IN_PROGRESS_LOCK = threading.Lock()
+RANGE_LOCK = threading.Lock()
 
 
 def slow_refresh_loop():
     category_id, category_name = find_deal_category_id()
+    stage_names = fetch_stages(category_id) if category_id else {}
     with STATE_LOCK:
         STATE["category_name"] = category_name or CATEGORY_NAME
         STATE["category_id"] = category_id
+        STATE["stage_names"] = stage_names
 
     while True:
         try:
@@ -421,113 +411,79 @@ def slow_refresh_loop():
         time.sleep(SLOW_REFRESH_SECONDS)
 
 
-def fast_refresh_for_date(date_str):
-    day_start_dt = datetime.strptime(date_str, "%Y-%m-%d")
-    day_end_dt = day_start_dt + timedelta(days=1)
-    day_start = day_start_dt.strftime("%Y-%m-%dT00:00:00")
-    day_end = day_end_dt.strftime("%Y-%m-%dT00:00:00")
-
-    incoming, outgoing, calls_by_user, call_err = fetch_calls_split(day_start_dt, day_end_dt)
-    won, lost, closed_err = fetch_closed_split(day_start, day_end)
-
-    bad_calls = {}
-    for uid, calls in calls_by_user.items():
-        bad_calls[uid] = sum(1 for c in calls if c["failed"])
-
-    entry = {
-        "in": incoming,
-        "out": outgoing,
-        "won": won,
-        "lost": lost,
-        "calls_detail": calls_by_user,
-        "bad_calls": bad_calls,
-        "no_split": call_err == "no_split",
-        "call_error": call_err if call_err != "no_split" else None,
-        "closed_error": closed_err,
-    }
-    with STATE_LOCK:
-        STATE["fast_cache"][date_str] = entry
-        STATE["last_fast_update"] = datetime.now().strftime("%H:%M:%S")
-    total_bad = sum(bad_calls.values())
-    print(f"[fast refresh] {date_str} — звонков вход:{sum(incoming.values())} исход:{sum(outgoing.values())} (плохих:{total_bad}) успех:{sum(won.values())} провал:{sum(lost.values())}")
-
-
-def fast_refresh_loop():
-    while True:
-        today = datetime.now().strftime("%Y-%m-%d")
-        try:
-            fast_refresh_for_date(today)
-        except Exception as e:
-            print(f"[fast refresh] ОШИБКА: {e}")
-        time.sleep(FAST_REFRESH_SECONDS)
-
-
-def refresh_plan_for_range(date_from, date_to):
+def refresh_range(date_from, date_to):
     with STATE_LOCK:
         category_id = STATE["category_id"]
     if not category_id:
         return
-    data, error = fetch_monthly_plan_stats(category_id, date_from, date_to)
+
+    start_dt = datetime.strptime(date_from, "%Y-%m-%d")
+    end_dt = datetime.strptime(date_to, "%Y-%m-%d")
+
+    calls_data, call_error = fetch_calls_in_range(start_dt, end_dt)
+    closed_data, closed_error = fetch_closed_in_range(category_id, date_from, date_to)
+
     key = f"{date_from}_{date_to}"
     with STATE_LOCK:
-        STATE["plan_cache"][key] = {
-            "data": data if not error else {},
-            "error": error,
+        STATE["range_cache"][key] = {
+            "calls": calls_data or {"incoming": {}, "outgoing": {}, "calls_by_user": {}},
+            "closed": closed_data or {"won": {}, "lost": {}},
+            "call_error": call_error,
+            "closed_error": closed_error,
             "computed_at": datetime.now().strftime("%H:%M:%S"),
         }
-    if error:
-        print(f"[plan] ОШИБКА расчёта плана {date_from}..{date_to}: {error}")
-    else:
-        total = sum(v["total"] for v in data.values())
-        print(f"[plan] {date_from}..{date_to} — сотрудников с закрытыми: {len(data)}, всего закрыто: {total}")
+    calls_count = sum((calls_data or {}).get("incoming", {}).values()) + sum((calls_data or {}).get("outgoing", {}).values())
+    closed_count = sum((closed_data or {}).get("won", {}).values()) + sum((closed_data or {}).get("lost", {}).values())
+    print(f"[range refresh] {date_from}..{date_to} — звонков: {calls_count}, закрыто: {closed_count}")
 
 
-def get_plan_data(date_from, date_to):
-    """Отдаёт кэш плана за период, запускает фоновый пересчёт если нужно
-    (кэш старше 5 минут или отсутствует). Не блокирует страницу."""
+def get_range_data(date_from, date_to):
+    """Отдаёт кэш за период, запускает фоновый пересчёт если нужно.
+    Не блокирует страницу — сразу отвечает тем, что есть (может быть пусто
+    при самом первом запросе этого периода)."""
     key = f"{date_from}_{date_to}"
     with STATE_LOCK:
-        entry = STATE["plan_cache"].get(key)
+        entry = STATE["range_cache"].get(key)
 
     if entry is None:
-        with PLAN_IN_PROGRESS_LOCK:
-            already_running = key in STATE["plan_in_progress"]
+        with RANGE_LOCK:
+            already_running = key in STATE["range_in_progress"]
             if not already_running:
-                STATE["plan_in_progress"].add(key)
+                STATE["range_in_progress"].add(key)
         if not already_running:
             def _bg(f=date_from, t=date_to, k=key):
                 try:
-                    refresh_plan_for_range(f, t)
+                    refresh_range(f, t)
                 except Exception as e:
-                    print(f"[plan on-demand] ОШИБКА: {e}")
+                    print(f"[range on-demand] ОШИБКА: {e}")
                 finally:
-                    with PLAN_IN_PROGRESS_LOCK:
-                        STATE["plan_in_progress"].discard(k)
+                    with RANGE_LOCK:
+                        STATE["range_in_progress"].discard(k)
             threading.Thread(target=_bg, daemon=True).start()
-        return {}, True, None  # пусто, ещё грузится
+        return None, True
 
-    return entry.get("data", {}), False, entry.get("error")
+    return entry, False
 
 
-def plan_refresh_loop():
-    """Раз в PLAN_REFRESH_SECONDS обновляет план для последнего запрошенного
-    периода (чтобы данные не протухали, пока страница открыта)."""
+def range_refresh_loop():
+    """Раз в RANGE_REFRESH_SECONDS обновляет данные для уже запрошенных
+    периодов, чтобы они не протухали, пока страница открыта."""
     while True:
-        time.sleep(PLAN_REFRESH_SECONDS)
+        time.sleep(RANGE_REFRESH_SECONDS)
         with STATE_LOCK:
-            keys = list(STATE["plan_cache"].keys())
+            keys = list(STATE["range_cache"].keys())
         for key in keys:
             try:
                 date_from, date_to = key.split("_", 1)
-                refresh_plan_for_range(date_from, date_to)
+                refresh_range(date_from, date_to)
             except Exception as e:
-                print(f"[plan refresh] ОШИБКА для {key}: {e}")
+                print(f"[range refresh] ОШИБКА для {key}: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Веб-сервер
 # ---------------------------------------------------------------------------
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
@@ -535,441 +491,446 @@ HTML_PAGE = """<!DOCTYPE html>
 <title>Активность сотрудников</title>
 <style>
   :root {
-    --accent: #4f46e5;
-    --accent-light: #eef2ff;
-    --green: #16a34a;
-    --green-light: #ecfdf3;
-    --red: #dc2626;
-    --red-light: #fef2f2;
-    --amber: #b45309;
-    --amber-light: #fffbeb;
-    --text: #1f2937;
-    --muted: #6b7280;
-    --border: #e5e7eb;
-    --bg: #f8f9fc;
+    --accent: #4f46e5; --accent-light: #eef2ff;
+    --green: #16a34a; --green-light: #ecfdf3;
+    --red: #dc2626; --red-light: #fef2f2;
+    --amber: #b45309; --amber-light: #fffbeb;
+    --text: #1f2937; --muted: #6b7280; --border: #e5e7eb; --bg: #f8f9fc;
   }
   * { box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-    background: var(--bg);
-    margin: 0;
-    padding: 32px;
-    color: var(--text);
-  }
-  .header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
-  h1 { font-size: 24px; font-weight: 700; margin: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background: var(--bg); margin: 0; padding: 28px; color: var(--text); }
+  h1 { font-size: 22px; font-weight: 700; margin: 0; }
   .subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; }
 
-  .toolbar { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; flex-wrap: wrap; }
-  .date-box { display: flex; align-items: center; gap: 8px; background: white; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border); box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
-  .date-box label { font-size: 13px; color: var(--muted); font-weight: 600; }
-  input[type=date] { border: none; font-size: 14px; font-family: inherit; color: var(--text); background: transparent; }
-  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
-  .status { font-size: 12.5px; color: var(--muted); }
-  .warning-banner { background: var(--amber-light); border: 1px solid #fcd34d; color: var(--amber); padding: 10px 16px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; }
-  .loading-banner { background: var(--accent-light); border: 1px solid #c7d2fe; color: var(--accent); padding: 10px 16px; border-radius: 10px; font-size: 13px; margin-bottom: 18px; }
+  .tabs { display: flex; gap: 6px; margin: 18px 0; border-bottom: 1px solid var(--border); }
+  .tab-btn { background: none; border: none; padding: 10px 18px; font-size: 14px; font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
 
-  .stats-row { display: flex; gap: 14px; margin-bottom: 22px; flex-wrap: wrap; }
-  .stat-card { background: white; border-radius: 14px; padding: 16px 20px; min-width: 150px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border: 1px solid var(--border); }
-  .stat-card .num { font-size: 26px; font-weight: 700; }
-  .stat-card .label { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .date-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .preset-btn { background: white; border: 1px solid var(--border); border-radius: 999px; padding: 7px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer; color: var(--text); }
+  .preset-btn:hover { background: var(--accent-light); }
+  .preset-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .date-box { display: flex; align-items: center; gap: 6px; background: white; padding: 6px 12px; border-radius: 10px; border: 1px solid var(--border); }
+  .date-box label { font-size: 12px; color: var(--muted); font-weight: 600; }
+  input[type=date] { border: none; font-size: 13px; font-family: inherit; color: var(--text); background: transparent; }
+  .search-box { display: flex; align-items: center; gap: 6px; background: white; padding: 6px 12px; border-radius: 10px; border: 1px solid var(--border); }
+  .search-box input { border: none; font-size: 13px; font-family: inherit; outline: none; min-width: 180px; }
+  .export-btn { background: white; border: 1px solid var(--border); border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .export-btn:hover { background: #f3f4f6; }
+
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 6px; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .status { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .warning-banner { background: var(--amber-light); border: 1px solid #fcd34d; color: var(--amber); padding: 10px 16px; border-radius: 10px; font-size: 13px; margin-bottom: 12px; }
+  .loading-banner { background: var(--accent-light); border: 1px solid #c7d2fe; color: var(--accent); padding: 10px 16px; border-radius: 10px; font-size: 13px; margin-bottom: 12px; }
+
+  .stats-row { display: flex; gap: 14px; margin-bottom: 20px; flex-wrap: wrap; }
+  .stat-card { background: white; border-radius: 14px; padding: 16px 20px; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,.05); border: 1px solid var(--border); }
+  .stat-card .num { font-size: 24px; font-weight: 700; }
+  .stat-card .label { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .stat-card.green .num { color: var(--green); }
   .stat-card.red .num { color: var(--red); }
   .stat-card.accent .num { color: var(--accent); }
 
-  .table-card { background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid var(--border); }
+  .table-card { background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.06); border: 1px solid var(--border); margin-bottom: 20px; }
   table { border-collapse: collapse; width: 100%; }
-  th, td { padding: 12px 16px; text-align: center; font-size: 13.5px; }
-  th { background: var(--accent); color: white; font-weight: 600; font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: 0; }
+  th, td { padding: 11px 14px; text-align: center; font-size: 13px; }
+  th { background: var(--accent); color: white; font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: .03em; cursor: pointer; user-select: none; }
+  th:hover { background: #433ccb; }
   td:first-child, th:first-child { text-align: left; }
-  tbody tr { border-bottom: 1px solid var(--border); transition: background 0.15s; }
+  tbody tr { border-bottom: 1px solid var(--border); }
   tbody tr:hover { background: #fafafa; }
   tbody tr.low-load { background: var(--green-light); }
-  tbody tr.low-load:hover { background: #dcfce7; }
-  .name-cell { font-weight: 600; }
-  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  tbody tr.expand-row td { background: #fafbff; padding: 14px 20px; text-align: left; }
+  .name-cell { font-weight: 600; cursor: pointer; }
+  .name-cell:hover { color: var(--accent); }
+  .name-link { color: inherit; text-decoration: none; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
   .badge.rec { background: var(--green); color: white; }
-  .num-cell { font-variant-numeric: tabular-nums; }
   .in-call { color: var(--accent); font-weight: 600; }
   .out-call { color: #7c3aed; font-weight: 600; }
   .won { color: var(--green); font-weight: 600; }
   .lost { color: var(--red); font-weight: 600; }
+  .conv-cell { font-weight: 700; }
+  .conv-high { color: var(--green); }
+  .conv-mid { color: var(--amber); }
+  .conv-low { color: var(--red); }
   .empty-cell { color: #cbd5e1; }
-  .export-btn { background: white; border: 1px solid var(--border); border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: 600; color: var(--text); cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
-  .export-btn:hover { background: #f3f4f6; }
-  .name-link { color: var(--text); text-decoration: none; }
-  .name-link:hover { color: var(--accent); text-decoration: underline; }
-  .plan-cell { min-width: 150px; }
-  .plan-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: #f1f5f9; margin-bottom: 4px; }
-  .plan-bar .won-part { background: var(--green); }
-  .plan-bar .lost-part { background: var(--red); }
-  .plan-label { font-size: 11.5px; color: var(--muted); }
-  .plan-label .over-limit { color: var(--red); font-weight: 700; }
-  .dup-badge { font-size: 10.5px; color: var(--amber); margin-left: 4px; cursor: help; }
+  .stage-chip { display: inline-block; background: var(--accent-light); color: var(--accent); padding: 4px 10px; border-radius: 8px; font-size: 12px; margin: 3px; }
 
-  .leaderboard { display: flex; gap: 14px; margin-bottom: 22px; flex-wrap: wrap; }
-  .lb-card { background: white; border-radius: 14px; padding: 14px 20px; flex: 1; min-width: 200px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
-  .lb-card .medal { font-size: 28px; }
-  .lb-card .lb-name { font-weight: 700; font-size: 14px; }
-  .lb-card .lb-pct { font-size: 13px; color: var(--green); font-weight: 700; }
-  .lb-card.gold { border-color: #fbbf24; background: linear-gradient(135deg, #fffbeb, white); }
-  .lb-card.silver { border-color: #cbd5e1; }
-  .lb-card.bronze { border-color: #fb923c33; }
-
-  .plan-status { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; display: inline-block; margin-bottom: 3px; }
-  .plan-status.done { background: var(--green-light); color: var(--green); }
-  .plan-status.pending { background: #f1f5f9; color: var(--muted); }
-  .plan-status.danger { background: var(--red-light); color: var(--red); }
-  .plan-period { font-size: 10px; color: var(--muted); }
-  .calls-clickable { cursor: pointer; text-decoration: underline dotted; }
-  .calls-clickable:hover { color: var(--accent); }
-  .bad-call-num { color: var(--red); font-weight: 600; }
-
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-  .modal-box { background: white; border-radius: 14px; width: 520px; max-width: 92vw; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column; }
-  .modal-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid var(--border); }
-  .modal-header h3 { margin: 0; font-size: 16px; }
-  .modal-close { background: none; border: none; font-size: 18px; cursor: pointer; color: var(--muted); }
-  .modal-body { padding: 12px 20px; overflow-y: auto; }
-  .call-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
-  .call-row .call-dir { width: 18px; text-align: center; }
-  .call-row .call-time { color: var(--muted); width: 60px; }
-  .call-row .call-dur { width: 50px; }
-  .call-row.failed { color: var(--red); }
-  .call-row a { color: var(--accent); text-decoration: none; margin-left: auto; font-size: 12px; }
+  .calls-toolbar { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+  .calls-filter-btn { background: white; border: 1px solid var(--border); border-radius: 999px; padding: 6px 14px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
+  .calls-filter-btn.active { background: var(--text); color: white; }
+  .call-row-failed { color: var(--red); }
+  .call-dir-badge { font-weight: 700; }
 </style>
 </head>
 <body>
-  <div class="header">
-    <div>
-      <h1>📊 Активность сотрудников</h1>
-      <div class="subtitle" id="subtitle">воронка «Досудебный отдел»</div>
-    </div>
+  <div>
+    <h1>📊 Активность сотрудников</h1>
+    <div class="subtitle" id="subtitle">воронка «Досудебный отдел»</div>
   </div>
 
-  <div class="toolbar">
-    <div class="date-box">
-      <label>Дата (звонки/сделки)</label>
-      <input type="date" id="datePicker">
-    </div>
-    <div class="date-box">
-      <label>План с</label>
-      <input type="date" id="planFromPicker">
-    </div>
-    <div class="date-box">
-      <label>по</label>
-      <input type="date" id="planToPicker">
-    </div>
-    <div class="date-box">
-      <label>🔍</label>
-      <input type="text" id="searchBox" placeholder="Поиск по сотруднику..." style="border:none; font-size:14px; font-family:inherit; outline:none; min-width:180px;">
-    </div>
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="summary">Сводка</button>
+    <button class="tab-btn" data-tab="calls">Звонки</button>
+  </div>
+
+  <div class="date-controls">
+    <button class="preset-btn" data-preset="today">Сегодня</button>
+    <button class="preset-btn" data-preset="yesterday">Вчера</button>
+    <button class="preset-btn" data-preset="yesterday_today">Вчера+сегодня</button>
+    <button class="preset-btn" data-preset="week">Неделя</button>
+    <button class="preset-btn" data-preset="month">Месяц</button>
+    <div class="date-box"><label>с</label><input type="date" id="rangeFrom"></div>
+    <div class="date-box"><label>по</label><input type="date" id="rangeTo"></div>
     <button id="exportBtn" class="export-btn">⬇ Экспорт CSV</button>
     <div class="status" id="status"><span class="live-dot"></span>обновление...</div>
   </div>
 
   <div id="banners"></div>
-
-  <div class="leaderboard" id="leaderboard"></div>
-
   <div class="stats-row" id="statsRow"></div>
 
-  <div class="table-card">
-    <table id="tbl">
-      <thead>
-        <tr>
-          <th>Сотрудник</th>
-          <th>Сделок в работе</th>
-          <th>Звонков вход</th>
-          <th>Звонков исход</th>
-          <th>Плохих звонков</th>
-          <th>Закрыто успех</th>
-          <th>Закрыто провал</th>
-          <th id="planHeader">План (месяц)</th>
-          <th>Начало работы</th>
-          <th>Перерыв</th>
-          <th>Рекомендация</th>
-        </tr>
-      </thead>
-      <tbody id="tbody"></tbody>
-    </table>
+  <div id="tab-summary" class="tab-panel active">
+    <div class="search-box" style="margin-bottom:14px; display:inline-flex;">
+      <span>🔍</span>
+      <input type="text" id="searchBox" placeholder="Поиск по сотруднику...">
+    </div>
+    <div class="table-card">
+      <table id="summaryTbl">
+        <thead>
+          <tr>
+            <th data-sort="name">Сотрудник</th>
+            <th data-sort="active_deals">Сделок в работе</th>
+            <th data-sort="calls_total">Звонков</th>
+            <th data-sort="closed_won">Закрыто успех</th>
+            <th data-sort="closed_lost">Закрыто провал</th>
+            <th data-sort="conversion">Конверсия</th>
+            <th>Начало работы</th>
+            <th>Перерыв</th>
+            <th>Рекомендация</th>
+          </tr>
+        </thead>
+        <tbody id="summaryBody"></tbody>
+      </table>
+    </div>
   </div>
 
-  <div id="callsModalOverlay" class="modal-overlay" style="display:none;">
-    <div class="modal-box">
-      <div class="modal-header">
-        <h3 id="callsModalTitle">Звонки</h3>
-        <button id="callsModalClose" class="modal-close">✕</button>
-      </div>
-      <div id="callsModalBody" class="modal-body"></div>
+  <div id="tab-calls" class="tab-panel">
+    <div class="calls-toolbar">
+      <select id="callsEmployeeFilter" class="calls-filter-btn"><option value="">Все сотрудники</option></select>
+      <button class="calls-filter-btn active" data-callfilter="all">Все</button>
+      <button class="calls-filter-btn" data-callfilter="ok">Успешные</button>
+      <button class="calls-filter-btn" data-callfilter="failed">Неудачные</button>
+      <div class="search-box"><span>🔍</span><input type="text" id="callsSearchBox" placeholder="Поиск по номеру телефона..."></div>
+    </div>
+    <div class="table-card">
+      <table id="callsTbl">
+        <thead>
+          <tr>
+            <th>Время</th>
+            <th>Сотрудник</th>
+            <th>Направление</th>
+            <th>Длительность</th>
+            <th>Телефон</th>
+            <th>Статус</th>
+            <th>Сделка</th>
+          </tr>
+        </thead>
+        <tbody id="callsBody"></tbody>
+      </table>
     </div>
   </div>
 
 <script>
-const datePicker = document.getElementById('datePicker');
-const planFromPicker = document.getElementById('planFromPicker');
-const planToPicker = document.getElementById('planToPicker');
-const today = new Date().toISOString().slice(0,10);
-datePicker.value = today;
+const rangeFrom = document.getElementById('rangeFrom');
+const rangeTo = document.getElementById('rangeTo');
+const today = new Date();
+const todayStr = today.toISOString().slice(0,10);
 
-// План-период сохраняется в localStorage — "на постоянной основе",
-// не сбрасывается при обновлении страницы. По умолчанию — текущий месяц.
-function defaultPlanRange() {
-  const now = new Date();
-  const from = new Date(now.getFullYear(), now.getMonth(), 1);
-  const to = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  return {from: from.toISOString().slice(0,10), to: to.toISOString().slice(0,10)};
-}
-const savedFrom = localStorage.getItem('plan_from');
-const savedTo = localStorage.getItem('plan_to');
-const defaults = defaultPlanRange();
-planFromPicker.value = savedFrom || defaults.from;
-planToPicker.value = savedTo || defaults.to;
+function fmtDate(d) { return d.toISOString().slice(0,10); }
 
-function savePlanRange() {
-  localStorage.setItem('plan_from', planFromPicker.value);
-  localStorage.setItem('plan_to', planToPicker.value);
+function applyPreset(preset) {
+  const t = new Date();
+  let from, to;
+  if (preset === 'today') { from = new Date(t); to = new Date(t); }
+  else if (preset === 'yesterday') { from = new Date(t); from.setDate(from.getDate()-1); to = new Date(from); }
+  else if (preset === 'yesterday_today') { to = new Date(t); from = new Date(t); from.setDate(from.getDate()-1); }
+  else if (preset === 'week') { to = new Date(t); from = new Date(t); from.setDate(from.getDate()-6); }
+  else if (preset === 'month') { to = new Date(t); from = new Date(t); from.setDate(from.getDate()-29); }
+  else return;
+  rangeFrom.value = fmtDate(from);
+  rangeTo.value = fmtDate(to);
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.toggle('active', b.dataset.preset === preset));
+  saveRange();
+  loadData();
 }
+
+function saveRange() {
+  localStorage.setItem('range_from', rangeFrom.value);
+  localStorage.setItem('range_to', rangeTo.value);
+}
+
+const savedFrom = localStorage.getItem('range_from');
+const savedTo = localStorage.getItem('range_to');
+if (savedFrom && savedTo) {
+  rangeFrom.value = savedFrom;
+  rangeTo.value = savedTo;
+} else {
+  rangeFrom.value = todayStr;
+  rangeTo.value = todayStr;
+  document.querySelector('[data-preset="today"]').classList.add('active');
+}
+
+document.querySelectorAll('.preset-btn').forEach(btn => {
+  btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
+});
+rangeFrom.addEventListener('change', () => { clearPresetActive(); saveRange(); loadData(); });
+rangeTo.addEventListener('change', () => { clearPresetActive(); saveRange(); loadData(); });
+function clearPresetActive() { document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active')); }
+
+// --- вкладки ---
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (window.__lastData) renderCurrentTab();
+  });
+});
+
+let sortState = {key: 'active_deals', dir: 1};
+document.querySelectorAll('#summaryTbl th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.dataset.sort;
+    sortState.dir = (sortState.key === key) ? -sortState.dir : 1;
+    sortState.key = key;
+    renderSummary(window.__lastData);
+  });
+});
+
+let callFilter = 'all';
+document.querySelectorAll('[data-callfilter]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('[data-callfilter]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    callFilter = btn.dataset.callfilter;
+    renderCalls(window.__lastData);
+  });
+});
+document.getElementById('callsEmployeeFilter').addEventListener('change', () => renderCalls(window.__lastData));
+document.getElementById('callsSearchBox').addEventListener('input', () => renderCalls(window.__lastData));
+document.getElementById('searchBox').addEventListener('input', () => renderSummary(window.__lastData));
 
 async function loadData() {
-  const date = datePicker.value;
-  const planFrom = planFromPicker.value;
-  const planTo = planToPicker.value;
   try {
-    const resp = await fetch(`/api/data?date=${date}&plan_from=${planFrom}&plan_to=${planTo}`);
+    const resp = await fetch(`/api/data?from=${rangeFrom.value}&to=${rangeTo.value}`);
     const data = await resp.json();
-    render(data);
+    window.__lastData = data;
+    renderCommon(data);
+    renderCurrentTab();
   } catch (e) {
     document.getElementById('status').innerText = 'Ошибка загрузки: ' + e;
   }
 }
 
+function renderCurrentTab() {
+  const activeTab = document.querySelector('.tab-btn.active').dataset.tab;
+  if (activeTab === 'summary') renderSummary(window.__lastData);
+  else renderCalls(window.__lastData);
+}
+
 function formatTime(iso) {
   if (!iso) return {text: '', stale: false};
-  const m = iso.match(/^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2})/);
+  const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
   if (!m) return {text: iso, stale: false};
   const [, y, mo, d, h, mi] = m;
-  const todayStr = new Date().toISOString().slice(0,10);
   const dateStr = `${y}-${mo}-${d}`;
   if (dateStr === todayStr) return {text: `${h}:${mi}`, stale: false};
   return {text: `${d}.${mo} ${h}:${mi}`, stale: true};
 }
 
-function render(data) {
-  window.__lastData = data; // для экспорта CSV и модалки звонков
-  document.getElementById('subtitle').innerText = `воронка «${data.category_name}»`;
-  document.getElementById('planHeader').innerText = `План (${data.plan_period_label})`;
+function renderCommon(data) {
+  document.getElementById('subtitle').innerText = `воронка «${data.category_name}» · период: ${data.range_label}`;
   document.getElementById('status').innerHTML =
-    `<span class="live-dot"></span>сделки: ${data.last_slow_update || '—'} · звонки/закрытые: ${data.last_fast_update || '—'}`;
+    `<span class="live-dot"></span>сделки: ${data.last_slow_update || '—'} · период обновлён: ${data.range_computed_at || '—'}`;
 
   const banners = document.getElementById('banners');
   banners.innerHTML = '';
-  if (data.still_loading) {
-    banners.innerHTML += `<div class="loading-banner">⏳ Первая загрузка данных ещё идёт (может занять пару минут) — цифры по сделкам появятся, как только фон досчитает.</div>`;
-  }
-  if (data.calls_loading) {
-    banners.innerHTML += `<div class="loading-banner">⏳ Считаю звонки и закрытые сделки за эту дату в фоне — обновится само через 10-20 секунд, страницу перезагружать не нужно.</div>`;
-  }
-  if (data.plan_loading) {
-    banners.innerHTML += `<div class="loading-banner">⏳ Считаю план за выбранный период (${data.plan_period_label}) в фоне — обновится само, страницу перезагружать не нужно.</div>`;
-  }
-  if (data.plan_error) {
-    banners.innerHTML += `<div class="warning-banner">⚠️ Ошибка при расчёте плана: ${data.plan_error}</div>`;
-  }
-  if (data.call_error) {
-    banners.innerHTML += `<div class="warning-banner">⚠️ Ошибка при получении звонков: ${data.call_error}</div>`;
-  }
-  if (data.closed_error) {
-    banners.innerHTML += `<div class="warning-banner">⚠️ Ошибка при получении закрытых сделок: ${data.closed_error}</div>`;
-  }
-  if (data.no_split) {
-    banners.innerHTML += `<div class="warning-banner">⚠️ Не удалось разделить звонки на входящие/исходящие (не хватает права «Телефония» у вебхука) — все звонки показаны в столбце «исход».</div>`;
-  }
-  const overLimitPeople = data.rows.filter(r => r.plan_lost > data.monthly_plan_half);
-  if (overLimitPeople.length > 0) {
-    banners.innerHTML += `<div class="warning-banner">🔴 У ${overLimitPeople.length} сотрудник(ов) провалов за месяц уже больше нормы (${data.monthly_plan_half} из плана ${data.monthly_plan_target}) — конверсия ниже допустимой: ${overLimitPeople.map(r=>r.name).join(', ')}</div>`;
-  }
+  if (data.still_loading) banners.innerHTML += `<div class="loading-banner">⏳ Первая загрузка данных ещё идёт (может занять минуту-две).</div>`;
+  if (data.range_loading) banners.innerHTML += `<div class="loading-banner">⏳ Считаю звонки и закрытые сделки за этот период — обновится само.</div>`;
+  if (data.call_error) banners.innerHTML += `<div class="warning-banner">⚠️ Ошибка при получении звонков: ${data.call_error}</div>`;
+  if (data.closed_error) banners.innerHTML += `<div class="warning-banner">⚠️ Ошибка при получении закрытых сделок: ${data.closed_error}</div>`;
 
-  const medals = ['🥇','🥈','🥉'];
-  const medalClass = ['gold','silver','bronze'];
-  const lb = document.getElementById('leaderboard');
-  if (data.leaderboard && data.leaderboard.length) {
-    lb.innerHTML = data.leaderboard.map((r,i) => {
-      const pct = Math.round((r.plan_total / data.monthly_plan_target) * 100);
-      return `<div class="lb-card ${medalClass[i]}">
-        <div class="medal">${medals[i]}</div>
-        <div>
-          <div class="lb-name">${r.name}</div>
-          <div class="lb-pct">${pct}% плана (${r.plan_total}/${data.monthly_plan_target})</div>
-        </div>
-      </div>`;
-    }).join('');
-  } else {
-    lb.innerHTML = '';
-  }
-
-  const totalDeals = data.rows.reduce((s,r) => s + r.active_deals, 0);
-  const totalCalls = data.rows.reduce((s,r) => s + r.calls_in + r.calls_out, 0);
-  const totalBad = data.rows.reduce((s,r) => s + (r.bad_calls||0), 0);
-  const totalWon = data.rows.reduce((s,r) => s + r.closed_won, 0);
-  const totalLost = data.rows.reduce((s,r) => s + r.closed_lost, 0);
-
+  const rows = data.rows || [];
+  const totalDeals = rows.reduce((s,r) => s + r.active_deals, 0);
+  const totalCalls = rows.reduce((s,r) => s + r.calls_in + r.calls_out, 0);
+  const totalWon = rows.reduce((s,r) => s + r.closed_won, 0);
+  const totalLost = rows.reduce((s,r) => s + r.closed_lost, 0);
   document.getElementById('statsRow').innerHTML = `
-    <div class="stat-card accent"><div class="num">${data.rows.length}</div><div class="label">Сотрудников в работе</div></div>
+    <div class="stat-card accent"><div class="num">${rows.length}</div><div class="label">Сотрудников в работе</div></div>
     <div class="stat-card accent"><div class="num">${totalDeals}</div><div class="label">Сделок в работе всего</div></div>
-    <div class="stat-card"><div class="num">${totalCalls}</div><div class="label">Звонков за день</div></div>
-    <div class="stat-card red"><div class="num">${totalBad}</div><div class="label">Плохих звонков</div></div>
+    <div class="stat-card"><div class="num">${totalCalls}</div><div class="label">Звонков за период</div></div>
     <div class="stat-card green"><div class="num">${totalWon}</div><div class="label">Закрыто успешно</div></div>
     <div class="stat-card red"><div class="num">${totalLost}</div><div class="label">Закрыто провал</div></div>
   `;
 
-  renderTable(data);
+  const empSelect = document.getElementById('callsEmployeeFilter');
+  const currentVal = empSelect.value;
+  empSelect.innerHTML = '<option value="">Все сотрудники</option>' +
+    rows.filter(r => r.calls_in + r.calls_out > 0).map(r => `<option value="${r.name}">${r.name}</option>`).join('');
+  empSelect.value = currentVal;
 }
 
-function renderTable(data) {
-  const query = document.getElementById('searchBox').value.trim().toLowerCase();
-  const filteredRows = query ? data.rows.filter(r => r.name.toLowerCase().includes(query)) : data.rows;
+function convClass(pct) {
+  if (pct >= 60) return 'conv-high';
+  if (pct >= 35) return 'conv-mid';
+  return 'conv-low';
+}
 
-  const tbody = document.getElementById('tbody');
+function renderSummary(data) {
+  if (!data) return;
+  const query = document.getElementById('searchBox').value.trim().toLowerCase();
+  let rows = (data.rows || []).filter(r => !query || r.name.toLowerCase().includes(query));
+
+  rows = rows.map(r => ({...r, calls_total: r.calls_in + r.calls_out,
+    conversion: (r.closed_won + r.closed_lost) ? Math.round(100 * r.closed_won / (r.closed_won + r.closed_lost)) : 0}));
+
+  rows.sort((a,b) => {
+    const k = sortState.key;
+    if (k === 'name') return sortState.dir * a.name.localeCompare(b.name);
+    return sortState.dir * ((a[k]||0) - (b[k]||0));
+  });
+
+  const lowLoadIds = new Set([...data.rows].sort((a,b)=>a.active_deals-b.active_deals).slice(0,5).map(r=>r.name));
+
+  const tbody = document.getElementById('summaryBody');
   tbody.innerHTML = '';
-  filteredRows.forEach((r, i) => {
+  rows.forEach(r => {
     const tr = document.createElement('tr');
-    if (i < data.low_load_top_n) tr.className = 'low-load';
+    if (lowLoadIds.has(r.name)) tr.className = 'low-load';
     const workStart = formatTime(r.work_start);
     const breakTime = formatTime(r.break_time);
-    const fmt = t => t.text ? (t.stale ? `<span class="stale" title="Не сегодня">${t.text}</span>` : t.text) : '<span class="empty-cell">—</span>';
-
-    const nameHtml = r.crm_link
-      ? `<a class="name-link" href="${r.crm_link}" target="_blank" title="Открыть сделки в Bitrix24">${r.name} ↗</a>`
-      : r.name;
-
-    const planTotal = r.plan_total || 0;
-    const wonPct = planTotal ? (r.plan_won / data.monthly_plan_target) * 100 : 0;
-    const lostPct = planTotal ? (r.plan_lost / data.monthly_plan_target) * 100 : 0;
-    const overLimit = r.plan_lost > data.monthly_plan_half;
-    const planDone = planTotal >= data.monthly_plan_target;
-    const dupBadge = r.duplicate_clients > 0
-      ? `<span class="dup-badge" title="${r.duplicate_clients} клиент(ов) с несколькими закрытыми сделками — возможен задвоенный учёт">⚠ ${r.duplicate_clients} дубл.</span>`
-      : '';
-    const statusBadge = planDone
-      ? '<span class="plan-status done">✅ План выполнен</span>'
-      : overLimit
-        ? '<span class="plan-status danger">⚠️ Провалов больше нормы</span>'
-        : '<span class="plan-status pending">В процессе</span>';
-    const planHtml = `
-      ${statusBadge}
-      <div class="plan-bar">
-        <div class="won-part" style="width:${wonPct}%"></div>
-        <div class="lost-part" style="width:${lostPct}%"></div>
-      </div>
-      <div class="plan-label">${planTotal}/${data.monthly_plan_target} · ${r.plan_won} усп / ${r.plan_lost} пров${dupBadge}</div>
-    `;
-
-    const totalCallsRow = (r.calls_in || 0) + (r.calls_out || 0);
-    const callsInHtml = r.calls_in
-      ? `<span class="calls-clickable" onclick="openCallsModal('${r.name.replace(/'/g,"\\'")}', 'in')">${r.calls_in}</span>`
-      : '0';
-    const callsOutHtml = r.calls_out
-      ? `<span class="calls-clickable" onclick="openCallsModal('${r.name.replace(/'/g,"\\'")}', 'out')">${r.calls_out}</span>`
-      : '0';
-    const badHtml = r.bad_calls
-      ? `<span class="bad-call-num calls-clickable" onclick="openCallsModal('${r.name.replace(/'/g,"\\'")}', 'bad')">${r.bad_calls}</span>`
-      : '0';
+    const fmt = t => t.text ? (t.stale ? `<span title="Не сегодня">${t.text}</span>` : t.text) : '<span class="empty-cell">—</span>';
+    const nameHtml = r.crm_link ? `<a class="name-link" href="${r.crm_link}" target="_blank">${r.name} ↗</a>` : r.name;
+    const convCls = convClass(r.conversion);
 
     tr.innerHTML = `
-      <td class="name-cell">${nameHtml}</td>
-      <td class="num-cell">${r.active_deals}</td>
-      <td class="num-cell in-call">${callsInHtml}</td>
-      <td class="num-cell out-call">${callsOutHtml}</td>
-      <td class="num-cell">${badHtml}</td>
-      <td class="num-cell won">${r.closed_won || 0}</td>
-      <td class="num-cell lost">${r.closed_lost || 0}</td>
-      <td class="plan-cell">${planHtml}</td>
+      <td class="name-cell" data-uid="${r.uid}">${nameHtml} <span style="font-size:11px;color:#94a3b8;">(клик — стадии)</span></td>
+      <td>${r.active_deals}</td>
+      <td><span class="in-call">${r.calls_in}</span> / <span class="out-call">${r.calls_out}</span></td>
+      <td class="won">${r.closed_won}</td>
+      <td class="lost">${r.closed_lost}</td>
+      <td class="conv-cell ${convCls}">${r.conversion}%</td>
       <td>${fmt(workStart)}</td>
       <td>${fmt(breakTime)}</td>
-      <td>${i < data.low_load_top_n ? '<span class="badge rec">Можно догрузить</span>' : ''}</td>
+      <td>${lowLoadIds.has(r.name) ? '<span class="badge rec">Можно догрузить</span>' : ''}</td>
     `;
+    tr.querySelector('.name-cell').addEventListener('click', () => toggleStageBreakdown(tr, r.uid, r.name));
     tbody.appendChild(tr);
   });
 }
 
-function openCallsModal(employeeName, filterType) {
-  const data = window.__lastData;
-  if (!data) return;
-  const row = data.rows.find(r => r.name === employeeName);
-  if (!row) return;
+async function toggleStageBreakdown(tr, uid, name) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('expand-row')) { next.remove(); return; }
+  document.querySelectorAll('.expand-row').forEach(e => e.remove());
 
-  let calls = row.calls_list || [];
-  if (filterType === 'in') calls = calls.filter(c => c.direction === 'in');
-  if (filterType === 'out') calls = calls.filter(c => c.direction === 'out');
-  if (filterType === 'bad') calls = calls.filter(c => c.failed);
+  const expandTr = document.createElement('tr');
+  expandTr.className = 'expand-row';
+  const td = document.createElement('td');
+  td.colSpan = 9;
+  td.innerHTML = 'Загружаю разбивку по стадиям...';
+  expandTr.appendChild(td);
+  tr.after(expandTr);
 
-  const titleMap = {in: 'входящие звонки', out: 'исходящие звонки', bad: 'плохие звонки'};
-  document.getElementById('callsModalTitle').innerText = `${employeeName} — ${titleMap[filterType] || 'звонки'}`;
-
-  const body = document.getElementById('callsModalBody');
-  if (!calls.length) {
-    body.innerHTML = '<p style="color:#94a3b8;">Нет данных по этим звонкам.</p>';
-  } else {
-    body.innerHTML = calls.map(c => {
-      const time = (c.time || '').replace('T', ' ').slice(0, 16);
-      const dirIcon = c.direction === 'in' ? '↓' : '↑';
-      const durMin = Math.floor(c.duration / 60);
-      const durSec = c.duration % 60;
-      const durText = c.duration ? `${durMin}:${String(durSec).padStart(2,'0')}` : '0:00';
-      const link = c.deal_link ? `<a href="${c.deal_link}" target="_blank">Открыть сделку ↗</a>` : '';
-      return `<div class="call-row ${c.failed ? 'failed' : ''}">
-        <span class="call-dir">${dirIcon}</span>
-        <span class="call-time">${time}</span>
-        <span class="call-dur">${durText}</span>
-        <span>${c.phone || ''}</span>
-        ${c.failed ? '<span title="Неудачный звонок">⚠️</span>' : ''}
-        ${link}
-      </div>`;
-    }).join('');
+  try {
+    const resp = await fetch(`/api/employee_stages?uid=${uid}`);
+    const data = await resp.json();
+    if (data.error) { td.innerHTML = `Ошибка: ${data.error}`; return; }
+    if (!data.stages.length) { td.innerHTML = 'Нет активных сделок.'; return; }
+    td.innerHTML = `<b>${name}</b> — сделки по стадиям: ` +
+      data.stages.map(s => `<span class="stage-chip">${s.stage_name}: ${s.count}</span>`).join('');
+  } catch (e) {
+    td.innerHTML = 'Ошибка загрузки: ' + e;
   }
-
-  document.getElementById('callsModalOverlay').style.display = 'flex';
 }
 
-document.getElementById('callsModalClose').addEventListener('click', () => {
-  document.getElementById('callsModalOverlay').style.display = 'none';
-});
-document.getElementById('callsModalOverlay').addEventListener('click', (e) => {
-  if (e.target.id === 'callsModalOverlay') e.target.style.display = 'none';
-});
+function renderCalls(data) {
+  if (!data) return;
+  const empFilter = document.getElementById('callsEmployeeFilter').value;
+  const phoneQuery = document.getElementById('callsSearchBox').value.trim();
+
+  let allCalls = [];
+  (data.rows || []).forEach(r => {
+    if (empFilter && r.name !== empFilter) return;
+    (r.calls_list || []).forEach(c => allCalls.push({...c, employee: r.name}));
+  });
+
+  if (callFilter === 'ok') allCalls = allCalls.filter(c => !c.failed);
+  if (callFilter === 'failed') allCalls = allCalls.filter(c => c.failed);
+  if (phoneQuery) allCalls = allCalls.filter(c => (c.phone||'').includes(phoneQuery));
+
+  allCalls.sort((a,b) => (b.time||'').localeCompare(a.time||''));
+
+  const tbody = document.getElementById('callsBody');
+  tbody.innerHTML = '';
+  if (!allCalls.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8;padding:24px;">Нет звонков по этим фильтрам за выбранный период</td></tr>';
+    return;
+  }
+  allCalls.slice(0, 500).forEach(c => {
+    const tr = document.createElement('tr');
+    if (c.failed) tr.className = 'call-row-failed';
+    const time = (c.time||'').replace('T',' ').slice(0,16);
+    const dirLabel = c.direction === 'in' ? '↓ Вход' : '↑ Исход';
+    const durMin = Math.floor(c.duration/60), durSec = c.duration%60;
+    const durText = `${durMin}:${String(durSec).padStart(2,'0')}`;
+    const statusText = c.failed ? '⚠️ Неудачный' : '✅ Успешный';
+    const link = c.deal_link ? `<a href="${c.deal_link}" target="_blank">Открыть ↗</a>` : '—';
+    tr.innerHTML = `
+      <td>${time}</td>
+      <td>${c.employee}</td>
+      <td class="call-dir-badge">${dirLabel}</td>
+      <td>${durText}</td>
+      <td>${c.phone || '—'}</td>
+      <td>${statusText}</td>
+      <td>${link}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+  if (allCalls.length > 500) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td colspan="7" style="text-align:center;color:#94a3b8;">Показаны первые 500 из ${allCalls.length} — сузьте фильтр или период</td>`;
+    tbody.appendChild(tr);
+  }
+}
 
 function exportCSV() {
   const data = window.__lastData;
   if (!data) return;
-  const query = document.getElementById('searchBox').value.trim().toLowerCase();
-  const rows = query ? data.rows.filter(r => r.name.toLowerCase().includes(query)) : data.rows;
-  const headers = ['Сотрудник','Сделок в работе','Звонков вход','Звонков исход','Закрыто успех','Закрыто провал','План всего','План успех','План провал','Дублей клиентов','Начало работы','Перерыв'];
+  const rows = data.rows || [];
+  const headers = ['Сотрудник','Сделок в работе','Звонков вход','Звонков исход','Закрыто успех','Закрыто провал','Конверсия %'];
   const lines = [headers.join(';')];
   rows.forEach(r => {
-    lines.push([
-      r.name, r.active_deals, r.calls_in||0, r.calls_out||0, r.closed_won||0, r.closed_lost||0,
-      r.plan_total||0, r.plan_won||0, r.plan_lost||0, r.duplicate_clients||0,
-      r.work_start||'', r.break_time||''
-    ].join(';'));
+    const conv = (r.closed_won + r.closed_lost) ? Math.round(100*r.closed_won/(r.closed_won+r.closed_lost)) : 0;
+    lines.push([r.name, r.active_deals, r.calls_in, r.calls_out, r.closed_won, r.closed_lost, conv].join(';'));
   });
-  const blob = new Blob(["\\uFEFF" + lines.join('\\n')], {type: 'text/csv;charset=utf-8;'});
+  const blob = new Blob(["\uFEFF" + lines.join('\n')], {type: 'text/csv;charset=utf-8;'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `активность_сотрудников_${datePicker.value}.csv`;
+  a.download = `активность_${rangeFrom.value}_${rangeTo.value}.csv`;
   a.click();
   URL.revokeObjectURL(url);
 }
-
-document.getElementById('searchBox').addEventListener('input', () => renderTable(window.__lastData));
 document.getElementById('exportBtn').addEventListener('click', exportCSV);
-datePicker.addEventListener('change', loadData);
-planFromPicker.addEventListener('change', () => { savePlanRange(); loadData(); });
-planToPicker.addEventListener('change', () => { savePlanRange(); loadData(); });
+
 loadData();
-setInterval(loadData, 20000); // обновление раз в 20 секунд
+setInterval(loadData, 25000);
 </script>
 </body>
 </html>
@@ -978,7 +939,7 @@ setInterval(loadData, 20000); // обновление раз в 20 секунд
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # тише в консоли, у нас свои print'ы
+        pass
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -989,68 +950,51 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(HTML_PAGE.encode("utf-8"))
         elif parsed.path == "/api/data":
             qs = urllib.parse.parse_qs(parsed.query)
-            date_str = qs.get("date", [datetime.now().strftime("%Y-%m-%d")])[0]
-            now = datetime.now()
-            default_plan_from = now.replace(day=1).strftime("%Y-%m-%d")
-            next_month = now.month % 12 + 1
-            next_month_year = now.year + (1 if now.month == 12 else 0)
-            default_plan_to = f"{next_month_year}-{next_month:02d}-01"
-            plan_from = qs.get("plan_from", [default_plan_from])[0]
-            plan_to = qs.get("plan_to", [default_plan_to])[0]
-            payload = self.build_payload(date_str, plan_from, plan_to)
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            date_from = qs.get("from", [today_str])[0]
+            date_to = qs.get("to", [today_str])[0]
+            payload = self.build_payload(date_from, date_to)
+            self._send_json(payload)
+        elif parsed.path == "/api/employee_stages":
+            qs = urllib.parse.parse_qs(parsed.query)
+            uid = qs.get("uid", [None])[0]
+            with STATE_LOCK:
+                category_id = STATE["category_id"]
+                stage_names = dict(STATE["stage_names"])
+            if not uid or not category_id:
+                self._send_json({"stages": [], "error": "нет данных"})
+                return
+            stages, error = fetch_employee_stage_breakdown(uid, category_id, stage_names)
+            self._send_json({"stages": stages, "error": error})
         else:
             self.send_response(404)
             self.end_headers()
 
-    def build_payload(self, date_str, plan_from, plan_to):
+    def _send_json(self, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def build_payload(self, date_from, date_to):
         with STATE_LOCK:
             users_by_id = dict(STATE["users_by_id"])
             active_deals = dict(STATE["active_deals"])
             attendance = dict(STATE["attendance"])
             category_name = STATE["category_name"]
             last_slow = STATE["last_slow_update"]
-            last_fast = STATE["last_fast_update"]
-            fast_entry = STATE["fast_cache"].get(date_str)
 
-        monthly_plan, plan_loading, plan_error = get_plan_data(plan_from, plan_to)
-
-        # если по этой дате ещё нет данных в кэше — запускаем расчёт В ФОНЕ,
-        # а сейчас сразу отвечаем тем, что есть (не блокируем страницу)
-        calls_loading = False
-        if fast_entry is None:
-            calls_loading = True
-            with FAST_IN_PROGRESS_LOCK:
-                already_running = date_str in STATE["fast_in_progress"]
-                if not already_running:
-                    STATE["fast_in_progress"].add(date_str)
-
-            if not already_running:
-                def _bg(d=date_str):
-                    try:
-                        fast_refresh_for_date(d)
-                    except Exception as e:
-                        print(f"[on-demand refresh] ОШИБКА: {e}")
-                    finally:
-                        with FAST_IN_PROGRESS_LOCK:
-                            STATE["fast_in_progress"].discard(d)
-                threading.Thread(target=_bg, daemon=True).start()
-
-        fast_entry = fast_entry or {}
-        incoming = fast_entry.get("in", {})
-        outgoing = fast_entry.get("out", {})
-        won = fast_entry.get("won", {})
-        lost = fast_entry.get("lost", {})
-        no_split = fast_entry.get("no_split", False)
-        calls_detail = fast_entry.get("calls_detail", {})
-        bad_calls = fast_entry.get("bad_calls", {})
-
-        is_today = date_str == datetime.now().strftime("%Y-%m-%d")
+        range_entry, range_loading = get_range_data(date_from, date_to)
+        range_entry = range_entry or {}
+        calls_data = range_entry.get("calls", {})
+        closed_data = range_entry.get("closed", {})
+        incoming = calls_data.get("incoming", {})
+        outgoing = calls_data.get("outgoing", {})
+        calls_by_user = calls_data.get("calls_by_user", {})
+        won = closed_data.get("won", {})
+        lost = closed_data.get("lost", {})
 
         crm_base = f"https://{PORTAL_DOMAIN}/crm/deal/list/?apply_filter=Y&FILTER%5BASSIGNED_BY_ID%5D%5B0%5D=" if PORTAL_DOMAIN else None
 
@@ -1061,70 +1005,48 @@ class Handler(BaseHTTPRequestHandler):
             co = outgoing.get(uid, 0)
             cw = won.get(uid, 0)
             cl = lost.get(uid, 0)
-            att = attendance.get(uid, {}) if is_today else {}
-            plan = monthly_plan.get(uid, {"won": 0, "lost": 0, "total": 0, "duplicate_clients": 0})
-            bad = bad_calls.get(uid, 0)
-            if ad or ci or co or cw or cl or plan["total"]:
+            att = attendance.get(uid, {})
+            if ad or ci or co or cw or cl:
                 rows.append({
+                    "uid": uid,
                     "name": name,
                     "active_deals": ad,
                     "calls_in": ci,
                     "calls_out": co,
-                    "bad_calls": bad,
                     "closed_won": cw,
                     "closed_lost": cl,
                     "work_start": att.get("start", ""),
                     "break_time": att.get("break", ""),
-                    "plan_won": plan["won"],
-                    "plan_lost": plan["lost"],
-                    "plan_total": plan["total"],
-                    "duplicate_clients": plan["duplicate_clients"],
                     "crm_link": (crm_base + str(uid)) if crm_base else None,
-                    "calls_list": calls_detail.get(uid, []),
+                    "calls_list": calls_by_user.get(uid, []),
                 })
 
         rows.sort(key=lambda r: r["active_deals"])
 
-        # красивая подпись периода из фактически выбранных дат (dd.mm.yyyy)
         def fmt_date(s):
             try:
                 return datetime.strptime(s, "%Y-%m-%d").strftime("%d.%m.%Y")
             except ValueError:
                 return s
-        plan_period_label = f"{fmt_date(plan_from)} – {fmt_date(plan_to)}"
-
-        leaderboard = sorted(
-            [r for r in rows if r["plan_total"] > 0],
-            key=lambda r: r["plan_total"] / MONTHLY_PLAN,
-            reverse=True,
-        )[:3]
+        range_label = f"{fmt_date(date_from)} – {fmt_date(date_to)}" if date_from != date_to else fmt_date(date_from)
 
         return {
             "category_name": category_name,
             "last_slow_update": last_slow,
-            "last_fast_update": last_fast,
-            "no_split": no_split,
-            "low_load_top_n": LOW_LOAD_TOP_N,
+            "range_computed_at": range_entry.get("computed_at"),
+            "range_label": range_label,
             "still_loading": last_slow is None,
-            "calls_loading": calls_loading,
-            "plan_loading": plan_loading,
-            "plan_error": plan_error,
-            "call_error": fast_entry.get("call_error"),
-            "closed_error": fast_entry.get("closed_error"),
-            "plan_period_label": plan_period_label,
-            "plan_from": plan_from,
-            "plan_to": plan_to,
-            "leaderboard": leaderboard,
-            "monthly_plan_target": MONTHLY_PLAN,
-            "monthly_plan_half": MONTHLY_PLAN // 2,
+            "range_loading": range_loading,
+            "call_error": range_entry.get("call_error"),
+            "closed_error": range_entry.get("closed_error"),
             "rows": rows,
         }
 
 
 def main():
-    global WEBHOOK_URL
-    parser = argparse.ArgumentParser(description="Живой дашборд активности сотрудников")
-    parser.add_argument("--webhook", default=None, help="URL входящего вебхука Bitrix24 (иначе берётся из переменной окружения BITRIX_WEBHOOK_URL)")
+    global WEBHOOK_URL, PORTAL_DOMAIN
+    parser = argparse.ArgumentParser(description="Дашборд активности сотрудников")
+    parser.add_argument("--webhook", default=None)
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
 
@@ -1133,7 +1055,6 @@ def main():
         print("ОШИБКА: не задан вебхук. Передайте --webhook или переменную окружения BITRIX_WEBHOOK_URL.")
         sys.exit(1)
 
-    global PORTAL_DOMAIN
     m = re.match(r"https?://([^/]+)", WEBHOOK_URL)
     PORTAL_DOMAIN = m.group(1) if m else None
 
@@ -1141,12 +1062,9 @@ def main():
 
     print("Запускаю фоновое обновление данных...")
     threading.Thread(target=slow_refresh_loop, daemon=True).start()
-    threading.Thread(target=fast_refresh_loop, daemon=True).start()
-    threading.Thread(target=plan_refresh_loop, daemon=True).start()
+    threading.Thread(target=range_refresh_loop, daemon=True).start()
 
     print(f"Сервер слушает на порту {port}")
-    print("Ctrl+C — остановить (при локальном запуске).")
-
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     try:
         server.serve_forever()
